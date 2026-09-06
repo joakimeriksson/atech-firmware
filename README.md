@@ -27,7 +27,8 @@ module drivers into `lib/atech_*`. Those drivers are not redistributed here.
 
 ```
 src/<app>/             one directory per app; main.cpp is what the Atech platform generates
-lib/atech_board/       board builds: variants/<name>.h holds the module instances for a layout
+boards/<name>.yaml     which module sits in which port — the source of truth for wiring
+lib/atech_board/       board builds: variants/<name>.h, rendered from boards/<name>.yaml
 lib/atech_glue/        the hosted-platform glue the SDK does not ship (AtechSerial, UI helpers)
 lib/atech_*/           the real module drivers, synced from the SDK (gitignored)
 lib/crsid, sid, sidtunes   third party, see THIRD-PARTY.md
@@ -37,9 +38,17 @@ dist/<build>/          what `make dist` collects for flashing or for the emulato
 
 **Adding an app**: a directory under `src/`, then an `[env:...]` block that filters to it.
 
-**Adding a board**: a header under `lib/atech_board/variants/` with the module instances for that
-port layout, a matching `ATECH_BOARD_<NAME>` branch in `atech_board.h`, and an environment that
-defines the flag. Apps never name a board; they include `<atech_board.h>` and use the instances.
+**Adding a board**: a descriptor under `boards/` naming the modules and their ports, then
+`make board-headers` to render `lib/atech_board/variants/<name>.h`, a matching
+`ATECH_BOARD_<NAME>` branch in `atech_board.h`, and an environment that defines the flag. Apps
+never name a board; they include `<atech_board.h>` and use the instances.
+
+GPIO numbers are never hand-typed. `make board-headers` resolves them through the Atech SDK's own
+board catalog and codegen, so the rule that a module snaps into the left column rotated 180° — and
+therefore which port supplies which line of a double-width module — stays the SDK's to define. The
+rendered headers are committed, so an ordinary build needs no SDK; only regenerating does.
+Anything the catalog cannot know, such as a module's measured physical layout, is hand-written
+below the `measured, not generated` marker and preserved across regeneration.
 
 ## The physical layout of a module is a board fact
 
