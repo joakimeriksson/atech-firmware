@@ -6,6 +6,7 @@
 #   make list                        the builds this repo defines
 #   make dist APP=pocket-synth       collect bootloader, partition table and app into dist/
 #   make sdk / make sync-sdk         install the open Atech SDK and re-copy the real drivers
+#   make board-headers               re-render lib/atech_board/variants/ from boards/*.yaml
 #   make check / make send KEY=.. VALUE=..   talk to a connected board through the SDK
 #
 # Needs: platformio (`pio`), uv. PORT defaults to the first ESP32-S3 CDC device.
@@ -14,7 +15,7 @@ APP   ?= pocket-synth
 PORT  ?= $(firstword $(wildcard /dev/cu.usbmodem*) /dev/cu.usbmodem101)
 ATECH  = .venv/bin/atech
 
-.PHONY: build flash monitor list dist clean sdk sync-sdk check send idf-minimal
+.PHONY: build flash monitor list dist clean sdk sync-sdk check send idf-minimal board-headers
 
 build:
 	pio run -e $(APP)
@@ -35,6 +36,11 @@ dist: build
 	@cp .pio/build/$(APP)/firmware.bin   dist/$(APP)/firmware.bin
 	@echo "$(APP) built from $$(git rev-parse --short HEAD)$$(git diff --quiet || echo -dirty)" | tee dist/$(APP)/PROVENANCE
 	@ls -l dist/$(APP)
+
+# Re-render every board variant header from its descriptor (needs the SDK: make sdk)
+board-headers:
+	for d in boards/*.yaml; do .venv/bin/python tools/gen-board-header.py "$$d" \
+	  "lib/atech_board/variants/$$(basename $$d .yaml).h"; done
 
 clean:
 	rm -rf .pio dist

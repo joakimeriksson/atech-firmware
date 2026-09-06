@@ -1,0 +1,35 @@
+# The board build the Pocket Synth runs on: which module sits in which port of the
+# 14-port motherboard, and what each instance is called in C++.
+#
+# This is the source of truth for wiring. `make board-headers` renders it — through
+# the Atech SDK's own catalog and codegen — into
+# lib/atech_board/variants/atech14-synth.h, so GPIO numbers are never hand-typed and
+# the left-column 180° rotation rule stays the SDK's to define.
+#
+# Loadable by the SDK directly: atech.project.Project.load("boards/atech14-synth.yaml").
+
+name: atech14-synth
+board: 14port
+
+modules:
+  - id: rotary_encoder      # Knob V1.1: encoder + 12-LED ring
+    instance: rotary_encoder_1
+    ports: [port_1, port_2]
+  - id: button              # play
+    instance: button_1
+    port: port_3
+  - id: button              # waveform
+    instance: button_2
+    port: port_4
+  - id: speaker             # MAX98357A I2S amp
+    instance: speaker_1
+    ports: [port_5, port_6]
+  - id: neopixel            # Light Grid V1.1, isolated top-middle slot
+    instance: light_grid_7
+    port: port_7
+  - id: st7735_tft          # 160x80 colour TFT
+    instance: st7735_tft_1
+    ports: [port_9, port_10]
+  - id: neopixel            # Light Grid V1.1, right column
+    instance: light_grid_11
+    port: port_11

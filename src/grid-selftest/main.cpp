@@ -27,10 +27,14 @@ static const char* CELL_NAME[9] = { "top-left", "top-centre", "top-right",
                                     "middle-left", "centre", "middle-right",
                                     "bottom-left", "bottom-centre", "bottom-right" };
 
-/// Where the board header says chain index `i` shows up on the glass.
-static const char* glassNameOfChain(uint8_t i) {
-    for (uint8_t cell = 0; cell < 9; cell++) { if (GRID_GLASS[cell] == i) return CELL_NAME[cell]; }
-    return "?";
+/// Where the board header says chain index `i` shows up on each grid's glass, board upright.
+/// The two differ: the slots hold the module 90 degrees apart.
+static void glassNamesOfChain(uint8_t i, const char** on7, const char** on11) {
+    *on7 = *on11 = "?";
+    for (uint8_t cell = 0; cell < 9; cell++) {
+        if (GRID_GLASS_PORT7[cell] == i)  *on7  = CELL_NAME[cell];
+        if (GRID_GLASS_PORT11[cell] == i) *on11 = CELL_NAME[cell];
+    }
 }
 
 static void showOnly(uint8_t index, uint8_t r, uint8_t g, uint8_t b) {
@@ -51,7 +55,8 @@ static void handleMessage(const char* action, const char* value) {
     if (strcmp(action, "grid_hold") == 0) {
         sweeping = false; chain = (uint8_t) atoi(value);
         showOnly(chain, 51, 51, 51);
-        Serial.printf("[grid] chain %u held, expected %s\n", chain, glassNameOfChain(chain));
+        const char *a, *b; glassNamesOfChain(chain, &a, &b);
+        Serial.printf("[grid] chain %u held, expected port7 %s / port11 %s\n", chain, a, b);
         return;
     }
     if (strcmp(action, "grid_pixel") == 0 || strcmp(action, "grid_cell") == 0) {
@@ -61,11 +66,12 @@ static void handleMessage(const char* action, const char* value) {
         uint8_t index;
         if (strcmp(action, "grid_cell") == 0) {
             uint8_t row = doc["row"] | 0, col = doc["col"] | 0;
-            index = GRID_GLASS[(row % 3) * 3 + (col % 3)];
-            Serial.printf("[grid] glass (%u,%u) is chain %u\n", row, col, index);
+            index = GRID_GLASS_PORT7[(row % 3) * 3 + (col % 3)];
+            Serial.printf("[grid] port7 glass (%u,%u) is chain %u\n", row, col, index);
         } else {
             index = doc["index"] | 0;
-            Serial.printf("[grid] chain %u, expected %s\n", index, glassNameOfChain(index));
+            const char *a, *b; glassNamesOfChain(index, &a, &b);
+            Serial.printf("[grid] chain %u, expected port7 %s / port11 %s\n", index, a, b);
         }
         sweeping = false; chain = index;
         showOnly(index, r, g, b);
@@ -75,13 +81,18 @@ static void handleMessage(const char* action, const char* value) {
 }
 
 void setup() {
+    // AtechSerial::connect() is a no-op — the generated firmware starts Serial itself, so
+    // an app must too. setTxTimeoutMs(0) keeps prints from blocking when no host is attached.
+    Serial.setRxBufferSize(8192);
+    Serial.begin(115200);
+    Serial.setTxTimeoutMs(0);
     serialLink.connect();
     serialLink.onMessage(handleMessage);
     light_grid_7.begin(); light_grid_11.begin();
     light_grid_7.clear(); light_grid_11.clear();
     light_grid_7.show(); light_grid_11.show();
     Serial.println("[grid] Light Grid self-test: one chain LED at a time, both modules");
-    Serial.println("[grid] hold the module with its ESP32 connector edge down and read the position");
+    Serial.println("[grid] hold the motherboard upright, USB-C at the bottom, and read both grids");
 }
 
 void loop() {
@@ -89,7 +100,8 @@ void loop() {
     if (sweeping && millis() - lastStep >= STEP_MS) {
         lastStep = millis();
         showOnly(chain, 51, 51, 51);
-        Serial.printf("[grid] chain %u lit, expected %s\n", chain, glassNameOfChain(chain));
+        const char *a, *b; glassNamesOfChain(chain, &a, &b);
+        Serial.printf("[grid] chain %u lit, expected port7 %s / port11 %s\n", chain, a, b);
         chain = (chain + 1) % NeoPixelGrid::NUM_LEDS;
     }
     delay(5);

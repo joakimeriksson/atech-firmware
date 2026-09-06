@@ -262,7 +262,9 @@ static void tunePump() {
 
 // ---- Light grids: one column per SID voice ----------------------------------------------------
 // Three columns, three voices; the bar height is that voice's envelope, filling from the bottom
-// row up with the topmost lit row fading in. Both grids show the same meter. The levels come from
+// row up with the topmost lit row fading in. Rows and columns here are the glass, with the
+// motherboard upright, so both grids show the same meter the same way round even though the two
+// slots hold the module 90 degrees apart. The levels come from
 // the emulated C64's SID while a tune plays and from the SID chip model the keys drive otherwise,
 // so a column means the same thing in both modes. Muting does not stop the meters: the tune is
 // still running, which is what they report.
@@ -278,8 +280,11 @@ static void gridsSetVoice(uint8_t voice, uint8_t level) {
     if (lit > 1.0f) lit = 1.0f;
     const uint8_t* c = VOICE_COLOUR[voice];
     uint8_t r = (uint8_t)(c[0] * lit), g = (uint8_t)(c[1] * lit), b = (uint8_t)(c[2] * lit);
-    light_grid_7.setPixelXY(row, voice, r, g, b);
-    light_grid_11.setPixelXY(row, voice, r, g, b);
+    // Not setPixelXY: the SDK's xyToIndex is plain row-major, but neither module is wired that
+    // way, and the two are mounted 90 degrees apart. Draw by glass geometry so a voice is a
+    // column on both — see GRID_GLASS_* in the board header.
+    gridSetGlassXY(light_grid_7,  GRID_GLASS_PORT7,  row, voice, r, g, b);
+    gridSetGlassXY(light_grid_11, GRID_GLASS_PORT11, row, voice, r, g, b);
   }
 }
 
