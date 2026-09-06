@@ -1,0 +1,14 @@
+.pio/
+.venv/
+dist/
+__pycache__/
+.DS_Store
+idf-minimal/build/
+idf-minimal/sdkconfig*
+
+# Atech SDK drivers: fetched by `make sync-sdk`, not redistributed here. The two first-party
+# libraries share the prefix, so they are named back in.
+lib/atech_*/
+!lib/atech_board/
+!lib/atech_glue/
+lib/SDK_VERSION

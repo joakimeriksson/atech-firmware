@@ -1,0 +1,6 @@
+{
+  "name": "atech_glue",
+  "version": "1.0.0",
+  "description": "The hosted-platform glue the Atech SDK does not ship as a module: the serial protocol transport, UI helpers, and the thin wrappers each app includes as modules/<kind>/<name>.h",
+  "build": { "flags": ["-I."] }
+}

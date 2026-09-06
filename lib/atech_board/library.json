@@ -1,0 +1,7 @@
+{
+  "name": "atech_board",
+  "version": "1.0.0",
+  "description": "Board builds for the Atech modular motherboards: the generated module instances for one port layout, plus the measured physical layout of those modules",
+  "dependencies": { "atech_glue": "*" },
+  "build": { "flags": ["-I."] }
+}
