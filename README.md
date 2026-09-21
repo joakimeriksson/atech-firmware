@@ -31,7 +31,8 @@ boards/<name>.yaml     which module sits in which port — the source of truth f
 lib/atech_board/       board builds: variants/<name>.h, rendered from boards/<name>.yaml
 lib/atech_glue/        the hosted-platform glue the SDK does not ship (AtechSerial, UI helpers)
 lib/atech_*/           the real module drivers, synced from the SDK (gitignored)
-lib/crsid, sid, sidtunes   third party, see THIRD-PARTY.md
+lib/crsid, sidtunes       third party, see THIRD-PARTY.md
+lib/sid/               the synth-mode SID core, this repository's own
 idf-minimal/           an ESP-IDF sample: different framework, its own project
 dist/<build>/          what `make dist` collects for flashing or for the emulator
 ```
@@ -65,3 +66,8 @@ These builds run unmodified in [esp32sim](https://github.com/joakimeriksson/esp3
 models the motherboard and its modules. `make dist` produces exactly the three binaries the
 emulator's demo manifests load, and the emulator's golden tests pin the console output, the audio
 and the instruction count for the Pocket Synth build.
+
+## License
+
+BSD 3-Clause, see [LICENSE](LICENSE). Vendored code under `lib/` keeps its own terms, listed in
+[THIRD-PARTY.md](THIRD-PARTY.md).

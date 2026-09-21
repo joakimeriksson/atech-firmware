@@ -15,7 +15,10 @@ covered by the cRSID licence.
 ## `lib/sid`
 
 A small 3-voice SID-style synthesis core written for this firmware — the synth mode, as
-opposed to cRSID's full chip emulation. Same licence as this repository.
+opposed to cRSID's full chip emulation. BSD 3-Clause, same as the rest of this repository
+(see `LICENSE`). Its envelope rate-counter periods are the 6581 hardware measurements
+published by **Dag Lem** in reSID; the same sixteen values appear in cRSID and in every
+accurate SID emulator, and are credited here as a courtesy.
 
 ## Atech SDK drivers — `lib/atech_*` (not in this repository)
 
