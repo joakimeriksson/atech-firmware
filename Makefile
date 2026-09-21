@@ -9,6 +9,7 @@
 #   make board-headers               re-render lib/atech_board/variants/ from boards/*.yaml
 #   make check / make send KEY=.. VALUE=..   talk to a connected board through the SDK
 #   make grid-view                   live 8x8 view of the distance sensor (sid-theremin build)
+#   make keys                        play the sid-theremin build from this keyboard, over Bluetooth MIDI
 #
 # Needs: platformio (`pio`), uv. PORT defaults to the first ESP32-S3 CDC device.
 
@@ -16,7 +17,7 @@ APP   ?= pocket-synth
 PORT  ?= $(firstword $(wildcard /dev/cu.usbmodem*) /dev/cu.usbmodem101)
 ATECH  = .venv/bin/atech
 
-.PHONY: build flash monitor list dist clean sdk sync-sdk check send idf-minimal board-headers grid-view
+.PHONY: build flash monitor list dist clean sdk sync-sdk check send idf-minimal board-headers grid-view keys
 
 build:
 	pio run -e $(APP)
@@ -62,6 +63,10 @@ send:
 # What the distance sensor sees, from the frames the sid-theremin build prints: ARGS="--max 1600"
 grid-view:
 	.venv/bin/python tools/grid-view.py --port $(PORT) $(ARGS)
+
+# The MacBook's keyboard as a piano for the sid-theremin build, over Bluetooth MIDI: ARGS='--play "60 64 67"'
+keys:
+	uv run --script tools/midi-keys.py $(ARGS)
 
 # The minimal ESP-IDF sample: a different framework, its own project
 idf-minimal:

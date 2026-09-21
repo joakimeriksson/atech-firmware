@@ -41,6 +41,20 @@
 //              steps (in semitones in FREE and CHROMA, gliding with the hand in FREE), without
 //              retriggering, the way C64 tunes fake a chord on one voice
 //
+// Keys. The board is also a MIDI port over Bluetooth LE, "SID Theremin": connect it in the Mac's Audio
+// MIDI Setup (MIDI Studio > Bluetooth) and any MIDI program or keyboard plays it. While keys are
+// held, and for two seconds after, they are the pitch and the hand is not; each mode takes a key as
+// it takes the hand —
+//   THEREMIN   one voice, the last key down sounds, letting it go gives the note back to the one
+//              before; a key pressed while another is held slides to it without a new attack
+//   HARP       every key plucks a string, three ringing at once
+//   FRETS      a key plucks the string; a key pressed while another is held is a hammer-on
+//   ARPEGGIO   the last key is the root (taken to the scale's nearest note, where there is a scale)
+// Keys are not rounded to the SCALE otherwise: a keyboard has its own notes. Every channel is heard.
+// Pitch bend is two semitones; the mod wheel (CC 1) adds vibrato; CC 74 moves the filter as the
+// tilt does; a program change picks the instrument; CC 120 and 123 let every key go. Velocity is
+// not used: a SID voice has no level of its own but its envelope.
+//
 // The SID is cRSID's, the emulation the Pocket Synth's tune player runs, driven register by register
 // as a C64 program drives the chip (sid_chip.h): what an instrument sets is what a tune would set.
 //
@@ -61,6 +75,9 @@
 //   {"action":"set_chip","value":"8580"}     6581 or 8580
 //   {"action":"screen_dump","value":"play"}  what the firmware draws, as 80 rows of RGB565 hex: play, knob, sound,
 //                                            or empty for whichever view is up now
+//   {"action":"note_on","value":"60"}        a key, as if from MIDI; note_off lets it go
+//   {"action":"midi","value":"e0 00 60"}     one MIDI message in hex
+//   {"action":"ble_packet","value":"80 80 90 3c 64"}   a BLE MIDI packet in hex, through the packet parser
 //   {"action":"status","value":""}           the controls as the firmware sees them now, and the settings
 //   {"action":"gate","value":"on"}           button 1 held, from the host: sounds the note with no hand there
 //   {"action":"imu_log","value":"on"}        print the hand distance, the angles, the voices and the timing at
@@ -87,6 +104,8 @@
 #include "modules/input/quadrature_knob.h"
 #include <atech_board.h>
 #include "sid_chip.h"
+#include "midi_in.h"
+#include "ble_midi.h"
 
 AtechSerial serialLink(115200);
 
@@ -124,6 +143,8 @@ static const float SNAP_HYSTERESIS  = 0.25f;  // semitones the tilt must favour 
 static const float VIBRATO_HZ = 5.5f;
 static const uint32_t VIBRATO_RAMP_MS = 500;  // it comes in over this long on a held note, like a player's
 static const float SYNC_TILT_OCTAVES = 0.9f;  // tilting left or right moves the synced voice this far either way
+static const uint32_t KEYS_HOLD_MS = 2000;   // after the last key, how long the keys keep the pitch from the hand
+static const float BEND_SEMITONES = 2.0f, MOD_WHEEL_SEMITONES = 0.6f;
 static const uint32_t STRIKE_MS = 20;         // one frame of a 50 Hz C64 player: how long an instrument's strike waveform lasts
 static const uint32_t KNOB_HOLD_MS = 800;
 static const uint32_t ADJUST_SHOW_MS = 1500;  // how long the ring shows a setting after the knob last touched it
@@ -213,7 +234,7 @@ static const Instrument INSTRUMENTS[] = {
     // sweep. Voice 1, a pulse, is hard-synced to the note and its own frequency is what moves — up into each note from
     // just above it, then slowly up and down for as long as the note lasts, which is the vowel-like sweep of that lead.
     // A plain pulse sits under it for the note's body; notes slide into each other and the vibrato comes late and deep.
-    { "RAT RACE",   PUL, 0,    1,  9, 12,  8, 0.5f,  0.2f,  0.5f, 0.30f, 350, 1.004f, PUL,  6,  SID_CTRL_SYNC, 2.0f, -0.9f, 300, 0.75f, 0.45f, SID_FILT_LP, 3.5f,  0.0f,   0, 0.0f, 0.0f,   6,  8, 70 },
+    { "RAT RACE",   PUL, 0,    1,  9, 12,  8, 0.5f,  0.2f,  0.5f, 0.30f, 350, 1.004f, PUL,  6,  SID_CTRL_SYNC, 2.0f, -0.9f,   300, 0.75f, 0.45f, SID_FILT_LP, 3.5f,  0.0f,   0, 0.0f, 0.0f,   6,  8, 70 },
 };
 #undef TRI
 #undef SAW
@@ -256,6 +277,10 @@ static volatile uint32_t knobTurns = 0, knobPresses = 0, button1Presses = 0, but
 static volatile bool recentreRequest = true;  // the first pose read becomes neutral
 static volatile float baseVolume = 0.3f;
 static volatile bool remoteGate = false;
+static volatile bool    keysOwnPitch = false;                // the keys have the pitch, not the hand
+static volatile int     keysDown = 0;
+static volatile uint32_t midiMessages = 0, blePackets = 0;   // since boot, for `status`
+static bool bleStarted = false;
 static volatile uint32_t imuLogMs = 0;        // the period; 0 is off
 static volatile bool gridLog = false;
 
@@ -359,6 +384,8 @@ static void readTilt() {
 /// How far the hand is, from the 8x8 frame the driver caches. The driver copies distances without
 /// their target status, so a lone zone can be junk: take the four nearest zones in range, drop the
 /// nearest, and average the rest.
+static float handPos = 0.0f;                     // -1..+1 of the range; the synth task's own, as pitchPos is what it shows
+
 static void readHand() {
     static float pos = 0.0f;
     static uint32_t lastSeenMs = 0;
@@ -382,7 +409,7 @@ static void readHand() {
         lastSeenMs = millis();
     }
     handSeen = zones >= HAND_MIN_ZONES || (wasSeen && millis() - lastSeenMs < HAND_GONE_MS);
-    pitchPos = pos;                                          // held when the hand leaves, so the note dies at its pitch
+    handPos = pos;                                           // held when the hand leaves, so the note dies at its pitch
 }
 
 // ---- Voices ---------------------------------------------------------------------------------------
@@ -537,6 +564,56 @@ static void readControls() {
     rotary_encoder_1.wasPressed();               // the edge is handled above
 }
 
+// ---- Keys: MIDI in -----------------------------------------------------------------------------------
+// Messages come from the Bluetooth host's task and from loop() (the serial actions), and are played
+// by the synth task: a queue between them. Everything below the queue belongs to the synth task.
+struct MidiMessage { uint8_t status, d1, d2; };
+static QueueHandle_t midiQueue = nullptr;
+
+static void midiReceive(void*, uint8_t status, uint8_t d1, uint8_t d2) {
+    MidiMessage m = { status, d1, d2 };
+    if (midiQueue && xQueueSend(midiQueue, &m, 0) == pdTRUE) { midiMessages = midiMessages + 1; }
+}
+static void blePacketReceive(const uint8_t* packet, size_t length) {
+    blePackets = blePackets + 1;
+    bleMidiParse(packet, length, midiReceive, nullptr);
+}
+
+static KeyStack keys;
+static struct { uint8_t note; bool legato; } struck[6];      // the keys that went down since the last look
+static int struckCount = 0;
+static bool keysRetrigger = false;               // a key went down with none held: a new note, not a slide
+static uint32_t keysLastMs = 0;
+static float bendSemis = 0.0f, modWheel = 0.0f, ccBright = 0.0f;
+
+static void readKeys() {
+    struckCount = 0;
+    keysRetrigger = false;
+    MidiMessage m;
+    while (midiQueue && xQueueReceive(midiQueue, &m, 0) == pdTRUE) {
+        const uint8_t type = m.status & 0xF0;    // omni: the channel is not looked at
+        if (type == 0x90 && m.d2 > 0) {
+            if (keys.count == 0) { keysRetrigger = true; }
+            if (struckCount < 6) { struck[struckCount].note = m.d1; struck[struckCount].legato = keys.count > 0; struckCount++; }
+            keys.press(m.d1);
+            keysLastMs = millis();
+        } else if (type == 0x80 || type == 0x90) {           // a note-on of velocity 0 is a note-off
+            keys.release(m.d1);
+            keysLastMs = millis();
+        } else if (type == 0xE0) {
+            bendSemis = ((int)((m.d2 << 7) | m.d1) - 8192) / 8192.0f * BEND_SEMITONES;
+        } else if (type == 0xB0) {
+            if (m.d1 == 1)        { modWheel = m.d2 / 127.0f; }
+            else if (m.d1 == 74)  { ccBright = clampf((m.d2 - 64) / 63.0f, -1.0f, 1.0f); }
+            else if (m.d1 == 120 || m.d1 == 123) { keys.clear(); }
+        } else if (type == 0xC0) {
+            instrument = m.d1 % INSTRUMENT_COUNT;
+        }
+    }
+    keysDown = keys.count;
+    keysOwnPitch = keys.count > 0 || (keysLastMs != 0 && millis() - keysLastMs < KEYS_HOLD_MS);
+}
+
 // ---- Echo -------------------------------------------------------------------------------------------
 // A feedback delay on the mix, after the SID: the one thing here a C64 could not do, which is why
 // its composers faked it with a second voice playing the tune late and quiet. Each repeat goes
@@ -581,7 +658,10 @@ static void synthTask(void*) {
         readTilt();
         readHand();
         readControls();
-        if (!handSensor) { pitchPos = tiltAway; }            // no distance sensor: the tilt is the pitch
+        readKeys();
+        const bool keysOwn = keysOwnPitch;
+        const float bright = clampf(tiltRight + ccBright, -1.0f, 1.0f);   // the tilt to the right, and CC 74
+        const float position = handSensor ? handPos : tiltAway;   // no distance sensor: the tilt is the pitch
 
         if (chipModel != sid.model()) { sid.setModel(chipModel); }
         if (mode != appliedMode) {               // button 1 or the serial link changed it
@@ -604,20 +684,39 @@ static void synthTask(void*) {
         }
         // with a hand for the pitch, tilting away or towards is the theremin's other antenna: the
         // volume, except in ARPEGGIO, where it is the speed
-        bool tiltIsFree = handSensor;
+        bool tiltIsFree = handSensor || keysOwn;
         float swell = tiltIsFree && appliedMode != MODE_ARP ? powf(2.0f, SWELL_OCTAVES * tiltAway) : 1.0f;
         speaker_1.setVolume(clampf(baseVolume * swell, 0.0f, 0.9f));
 
         // strings and frets are notes, so FREE there is every semitone
         const Scale& scale = SCALES[plucked && scaleIndex == 0 ? 1 : scaleIndex];
-        held = frets ? fretBelow(centreNote + pitchPos * rangeSemis, held, scale)
-                     : snapToScale(centreNote + pitchPos * rangeSemis, held, scale);
+        if (keysOwn) {
+            // a keyboard has its own notes; only an arpeggio's root is taken to the scale, which its chord is built in
+            if (keys.count > 0) { held = appliedMode == MODE_ARP && scale.count ? snapToScale(keys.top(), held, scale) : (float)keys.top(); }
+        } else {
+            held = frets ? fretBelow(centreNote + position * rangeSemis, held, scale)
+                         : snapToScale(centreNote + position * rangeSemis, held, scale);
+        }
+        // written once a pass: loop() draws from it on the other core, and must not see a value on its way
+        pitchPos = keysOwn ? clampf((held - centreNote) / rangeSemis, -1.0f, 1.0f) : position;
         const float glide = smoothing(blockMs, scale.count ? GLIDE_SNAP_MS : GLIDE_FREE_MS);
-        bool playing = droneHeld || handSeen;
+        bool playing = droneHeld || (keysOwn ? keys.count > 0 : handSeen);
+        if (keysRetrigger) { note = held; }      // a new note starts on its pitch
 
         float vibrato = 0.0f, arpNote = held;
         bool arpGlides = false;
-        if (harp) {
+        if (plucked && keysOwn) {
+            // every key plucks; in FRETS a key pressed while another is held is a hammer-on, and letting
+            // it go, a pull-off back to the key still held
+            for (int k = 0; k < struckCount; k++) {
+                bool hammer = frets && struck[k].legato && sid.envelope(0) >= FRET_REPLUCK_BELOW;
+                if (hammer) { stepMs = millis(); } else { pluck(struck[k].note, inst, strings); }
+                lastString = struck[k].note;
+            }
+            if (frets && keys.count > 0 && lastString != (float)keys.top()) { lastString = keys.top(); stepMs = millis(); }
+            if (droneHeld && !wasDrone) { pluck(held, inst, strings); }
+            wasPresent = false;                  // the hand, when it has the pitch back, arrives afresh
+        } else if (harp) {
             // the hand plucks each string it arrives at; without a distance sensor the tilt always does
             bool present = handSensor ? handSeen : true;
             if ((present && (held != lastString || !wasPresent)) || (droneHeld && !wasDrone)) { pluck(held, inst, strings); }
@@ -634,6 +733,8 @@ static void synthTask(void*) {
             if (present) { lastString = held; }
             wasPresent = present;
         } else {
+            if (keysRetrigger && voiceGate[0]) { releaseVoice(0); releaseVoice(1); }   // key up and key down inside one look
+            if (struckCount) { stepMs = millis(); }          // a synced voice sweeps into every key
             gateVoice(0, playing);
             gateVoice(1, playing && inst.second > 0.0f);
             gateVoice(2, false);
@@ -680,12 +781,12 @@ static void synthTask(void*) {
                 float sounding = plucked ? (lastString >= 0.0f ? lastString : held)
                                : appliedMode == MODE_ARP ? (arpGlides ? note + arpNote : arpNote) : note;
                 // portamento, where the instrument has it; a note after a silence starts on its pitch, and so does a string
-                if (inst.glideMs && playing && !plucked) { slid += smoothing(blockMs, inst.glideMs) * (sounding - slid); } else { slid = sounding; }
-                float hz = noteToHz(min(slid + vibrato * sinf(lfo), HIGHEST_NOTE));
+                if (inst.glideMs && playing && !plucked && !keysRetrigger) { slid += smoothing(blockMs, inst.glideMs) * (sounding - slid); } else { slid = sounding; }
+                float hz = noteToHz(min(slid + bendSemis + (vibrato + MOD_WHEEL_SEMITONES * modWheel) * sinf(lfo), HIGHEST_NOTE));
                 float modRatio = inst.modRatio;
                 if (inst.mod == SID_CTRL_SYNC) {
                     float octaves = inst.modSweep * expf(-(float)(millis() - sweepFromMs) / (float)max((int)inst.modSweepMs, 1))
-                                  + SYNC_TILT_OCTAVES * tiltRight + inst.modLfo * sinf(modLfo);
+                                  + SYNC_TILT_OCTAVES * bright + inst.modLfo * sinf(modLfo);
                     modRatio = clampf(inst.modRatio * powf(2.0f, octaves), 1.02f, 6.0f);   // under 1 the sync has nothing to tear
                 }
                 sid.setFreqHz(0, inst.mod == SID_CTRL_SYNC ? hz * modRatio : hz);
@@ -707,7 +808,7 @@ static void synthTask(void*) {
         // voice 3 as a ring or sync source is kept out of the mix the way C64 tunes keep it out: off the
         // filter's input and behind the 3OFF bit. On a 6581 a silent voice is not quite silent
         const bool voice3Unheard = inst.mod && !strings;
-        sid.setFilter(noteToHz(follow) * powf(2.0f, inst.cutoff + 2.0f * tiltRight + sweep),
+        sid.setFilter(noteToHz(follow) * powf(2.0f, inst.cutoff + 2.0f * bright + sweep),
                       (uint8_t)constrain((int)inst.resonance + resonance - 8, 0, 15),
                       inst.filter ? (voice3Unheard ? 0x03 : 0x07) : 0x00,
                       inst.filter | inst.level | (voice3Unheard ? SID_FILT_3OFF : 0));
@@ -902,11 +1003,12 @@ template <class G> static void drawPlaying(G& g) {
     g.drawLine(58, 58, 58, 61, UI_LABEL);                   // clear of the bottom line's capitals, which start at y 64
     g.fillRect(cents >= 0 ? 58 : 58 + cents, 59, abs(cents) + 1, 2, UI_ACCENT);
 
-    if (handSensor) {                                        // the hand: a marker on a bar, top is nearest
+    const bool keysShown = keysOwnPitch;
+    if (handSensor || keysShown) {                           // the hand, or the key: a marker on a bar, top is highest
         const int hx = 104, hw = 7;
         g.drawRect(hx, by, hw, bs, UI_LABEL);
         int my = by + bs / 2 - (int)(pitchPos * (bs / 2 - 3));
-        g.fillRect(hx + 1, my - 1, hw - 2, 3, handSeen ? UI_ACCENT : 0x39E7);
+        g.fillRect(hx + 1, my - 1, hw - 2, 3, (keysShown ? keysDown > 0 : handSeen) ? UI_ACCENT : 0x39E7);
     }
     g.drawRect(bx, by, bs, bs, UI_LABEL);
     g.drawLine(bx + bs / 2, by + 1, bx + bs / 2, by + bs - 2, 0x39E7);    // dim crosshair
@@ -916,7 +1018,7 @@ template <class G> static void drawPlaying(G& g) {
 
     g.setFont(&FreeSans9pt7b);
     g.setCursor(6, 77);
-    if (imuPresent || handSensor) {
+    if (imuPresent || handSensor || keysShown) {
         // the setting the knob is on, and its value
         int param = knobParam;
         char value[12];
@@ -926,10 +1028,15 @@ template <class G> static void drawPlaying(G& g) {
         g.print(" ");
         g.setTextColor(UI_LABEL);
         g.print(value);
-        g.setFont(nullptr);                       // what the pitch follows, in the built-in 6x8 font
-        g.setTextColor(UI_ACCENT);
-        g.setCursor(130, 68);
-        g.print(handSensor ? "HAND" : "TILT");
+        g.setFont(nullptr);                       // in the built-in 6x8 font: Bluetooth, lit when a host is connected...
+        if (bleStarted) {
+            g.setTextColor(bleMidiConnected() ? UI_VALUE : 0x39E7);
+            g.setCursor(136, 62);
+            g.print("BLE");
+        }
+        g.setTextColor(UI_ACCENT);                // ...and what the pitch follows
+        g.setCursor(130, 71);
+        g.print(keysShown ? "KEYS" : handSensor ? "HAND" : "TILT");
     } else {
         g.setTextColor(ST7735_TFT::COLOR_RED);
         g.print("NO SENSORS: 13, 14");
@@ -960,6 +1067,19 @@ static void drawScreen() {
     framesDrawn = framesDrawn + 1;
 }
 
+/// Hex bytes, "90 3c 64", into `out`; how many there were.
+static size_t hexBytes(const char* text, uint8_t* out, size_t max) {
+    size_t count = 0;
+    while (*text && count < max) {
+        char* end;
+        long byte = strtol(text, &end, 16);
+        if (end == text) { break; }
+        out[count++] = (uint8_t) byte;
+        text = end;
+    }
+    return count;
+}
+
 static void handleMessage(const char* action, const char* value) {
     int n = atoi(value);
     if (strcmp(action, "recenter") == 0)                                  { recentreRequest = true; }
@@ -977,6 +1097,9 @@ static void handleMessage(const char* action, const char* value) {
                       (unsigned long)millis(), (unsigned)framesDrawn, (long)knobTurn.position(), (unsigned)knobTurn.bouncesIgnored(), rotary_encoder_1.isPressed() ? "DOWN" : "up",
                       (unsigned)knobTurns, (unsigned)knobPresses, button_1.isPressed() ? "DOWN" : "up", (unsigned)button1Presses,
                       button_2.isPressed() ? "DOWN" : "up", (unsigned)button2Presses);
+        Serial.printf("[status] Bluetooth MIDI %s; %u packets, %u MIDI messages taken; %d keys down, the pitch is the %s; free heap %u\n",
+                      !bleStarted ? "not started" : bleMidiConnected() ? "connected" : "advertising", (unsigned)blePackets, (unsigned)midiMessages,
+                      (int)keysDown, keysOwnPitch ? "keys'" : "hand's", (unsigned)ESP.getFreeHeap());
         Serial.printf("[status] mode %s, knob on %s = %s, instrument %s, last knob use %lu ms ago\n", MODE_NAMES[mode], PARAMS[knobParam].name, value,
                       INSTRUMENTS[instrument].name, adjustedMs ? (unsigned long)(millis() - adjustedMs) : 0UL);
         return;
@@ -996,6 +1119,14 @@ static void handleMessage(const char* action, const char* value) {
         Serial.setTxTimeoutMs(SERIAL_TX_TIMEOUT_MS);
         delete shot;
         return;
+    }
+    else if (strcmp(action, "note_on") == 0 && n >= 0 && n <= 127)        { midiReceive(nullptr, 0x90, (uint8_t)n, 100); }
+    else if (strcmp(action, "note_off") == 0 && n >= 0 && n <= 127)       { midiReceive(nullptr, 0x80, (uint8_t)n, 0); }
+    else if (strcmp(action, "midi") == 0 || strcmp(action, "ble_packet") == 0) {
+        uint8_t bytes[32];
+        size_t count = hexBytes(value, bytes, sizeof(bytes));
+        if (action[0] == 'b') { bleMidiParse(bytes, count, midiReceive, nullptr); }
+        else if (count >= 1 && (bytes[0] & 0x80)) { midiReceive(nullptr, bytes[0], count > 1 ? bytes[1] : 0, count > 2 ? bytes[2] : 0); }
     }
     else if (strcmp(action, "gate") == 0)                                 { remoteGate = strcmp(value, "off") != 0; }
     else if (strcmp(action, "imu_log") == 0)                              { imuLogMs = strcmp(value, "off") == 0 ? 0 : constrain(n ? n : 200, 20, 5000); }
@@ -1046,6 +1177,13 @@ void setup() {
     Serial.printf("[theremin] one screen frame takes %u ms; the I2S DMA holds %u ms of sound\n",
                   (unsigned)(millis() - t0), (unsigned)(8 * 256 * 1000 / SAMPLE_RATE));
 
+    // Bluetooth last of all that allocates: its host and controller take their memory from what is left
+    midiQueue = xQueueCreate(64, sizeof(MidiMessage));
+    uint32_t heapBefore = ESP.getFreeHeap();
+    bleStarted = bleMidiBegin("SID Theremin", blePacketReceive);
+    Serial.printf("[theremin] Bluetooth MIDI %s; it took %u KB of heap, %u KB are free\n", bleStarted ? "advertising as \"SID Theremin\"" : "did not start",
+                  (unsigned)((heapBefore - ESP.getFreeHeap()) / 1024), (unsigned)(ESP.getFreeHeap() / 1024));
+
     // Core 0, above the IMU's poll task: it sleeps in the I2S write most of the time
     xTaskCreatePinnedToCore(synthTask, "Synth", 4096, NULL, 5, NULL, 0);
     Serial.println("[theremin] hold the board flat, USB-C towards you; a hand over the sensor plays, button 1 drones");
@@ -1053,7 +1191,7 @@ void setup() {
 
 void loop() {
     static uint32_t lastLogMs = 0, frames = 0;
-    static int postedWave = -1, postedScale = -1, postedGate = -1, postedMode = -1, postedParam = -1;
+    static int postedWave = -1, postedScale = -1, postedGate = -1, postedMode = -1, postedParam = -1, postedBle = -1;
     static int32_t postedKnob = 0;
 
     serialLink.maintain();
@@ -1063,6 +1201,7 @@ void loop() {
         paramValue(knobParam, value, sizeof(value));
         Serial.printf("[knob] position %ld: %s = %s\n", (long)postedKnob, PARAMS[knobParam].name, value);
     }
+    if (bleStarted && postedBle != (int)bleMidiConnected()) { postedBle = bleMidiConnected(); serialLink.postStateEvent("bluetooth_midi", postedBle ? "connected" : "advertising"); }
     if (postedParam != knobParam) { postedParam = knobParam;   serialLink.postStateEvent("knob_setting", PARAMS[postedParam].name); }
     if (postedMode != mode)       { postedMode = mode;         serialLink.postStateEvent("mode", MODE_NAMES[postedMode]); }
     if (postedWave != instrument) {
@@ -1089,11 +1228,11 @@ void loop() {
         frames++;
     }
     if (logMs && millis() - lastLogMs >= logMs) {
-        Serial.printf("[imu] hand %s %4d mm  pitch %6.1f roll %6.1f -> pos %+.2f away %+.2f right %+.2f note %.2f env %3u/%3u/%3u  voice 1 at %.1f Hz, 3 at %.1f, cutoff %.0f  ctl %02x/%02x/%02x  peak %d\n",
+        Serial.printf("[imu] hand %s %4d mm  pitch %6.1f roll %6.1f -> pos %+.2f away %+.2f right %+.2f note %.2f keys %d env %3u/%3u/%3u  voices %.1f/%.1f/%.1f Hz, cutoff %.0f  ctl %02x/%02x/%02x  peak %d\n",
                       handSensor ? (handSeen ? "seen" : "none") : "n/a ", handMm, rawPitch, rawRoll,
-                      pitchPos, tiltAway, tiltRight, shownNote,
+                      pitchPos, tiltAway, tiltRight, shownNote, (int)keysDown,
                       sid.envelope(0), sid.envelope(1), sid.envelope(2),
-                      sid.freqHz(0), sid.freqHz(2), sid.cutoffHz(),
+                      sid.freqHz(0), sid.freqHz(1), sid.freqHz(2), sid.cutoffHz(),
                       sid.control(0), sid.control(1), sid.control(2), (int)outputPeak);
         outputPeak = 0;
         static uint32_t lastGridFrames = 0;
