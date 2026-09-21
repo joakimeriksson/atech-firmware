@@ -1,7 +1,7 @@
 # Atech firmware
 
 Firmware for the Atech modular boards: an ESP32-S3 motherboard whose ports take snap-in modules
-(display, knob, buttons, speaker, LED grids), programmed against the open `atech` SDK. One repo,
+(display, knob, buttons, speaker, LED grids, sensors), programmed against the open `atech` SDK. One repo,
 several builds, because the hardware is a kit and the interesting part is which modules are in
 which ports.
 
@@ -11,6 +11,7 @@ A build is an **app** plus a **board**:
 | --- | --- | --- | --- |
 | `pocket-synth` | `src/pocket-synth` | atech14-synth | The Pocket Synth: a SID-chip synth and C64 tune player, TFT UI, knob and buttons, per-voice VU on the light grids |
 | `grid-selftest` | `src/grid-selftest` | atech14-synth | Light Grid bring-up: walks the chain one LED at a time and names where each should appear |
+| `sid-theremin` | `src/sid-theremin` | atech14-theremin | The SID Theremin: a hand over the distance sensor (port 13) is the pitch, the tilt of the board (IMU, port 14) the filter and the volume. Four modes: theremin, harp (the hand plucks the scale's strings), frets (one string, the pitch the fret below the hand), arpeggio; eleven instruments built the way C64 composers built theirs, a Synthex-style laser harp among them, on cRSID's SID (6581 or 8580). Plays with either sensor missing |
 
 ```sh
 make list                      # the builds this repo defines

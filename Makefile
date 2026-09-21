@@ -8,6 +8,7 @@
 #   make sdk / make sync-sdk         install the open Atech SDK and re-copy the real drivers
 #   make board-headers               re-render lib/atech_board/variants/ from boards/*.yaml
 #   make check / make send KEY=.. VALUE=..   talk to a connected board through the SDK
+#   make grid-view                   live 8x8 view of the distance sensor (sid-theremin build)
 #
 # Needs: platformio (`pio`), uv. PORT defaults to the first ESP32-S3 CDC device.
 
@@ -15,7 +16,7 @@ APP   ?= pocket-synth
 PORT  ?= $(firstword $(wildcard /dev/cu.usbmodem*) /dev/cu.usbmodem101)
 ATECH  = .venv/bin/atech
 
-.PHONY: build flash monitor list dist clean sdk sync-sdk check send idf-minimal board-headers
+.PHONY: build flash monitor list dist clean sdk sync-sdk check send idf-minimal board-headers grid-view
 
 build:
 	pio run -e $(APP)
@@ -57,6 +58,10 @@ check:
 # usage: make send KEY=grid_hold VALUE=4
 send:
 	$(ATECH) send --port $(PORT) $(KEY) '$(VALUE)'
+
+# What the distance sensor sees, from the frames the sid-theremin build prints: ARGS="--max 1600"
+grid-view:
+	.venv/bin/python tools/grid-view.py --port $(PORT) $(ARGS)
 
 # The minimal ESP-IDF sample: a different framework, its own project
 idf-minimal:
