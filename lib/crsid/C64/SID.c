@@ -224,9 +224,11 @@ int cRSID_emulateWaves (cRSID_SIDinstance *SID) {
   }
 
  }
+#ifndef CRSID_SID_ONLY /* Atech firmware: a build that plays the SID alone, with no C64 memory behind it (sid-theremin) */
  //update readable SID1-registers (some SID tunes might use 3rd channel ENV3/OSC3 value as control)
  SID->C64->IObankRD[SID->BaseAddress+0x1B] = WavGenOut>>8; //OSC3, ENV3 (some players rely on it, unfortunately even for timing)
  SID->C64->IObankRD[SID->BaseAddress+0x1C] = SID->EnvelopeCounter[14]; //Envelope
+#endif
 
 
  //Filter

@@ -8,6 +8,11 @@ A full C64 in software (6502 CPU, SID, CIA, VIC) by **Hermit (Mihaly Horvath)**,
 WTFPL: "do what the fuck you want with the code, but please mention me as the original
 author" — hence this file. `lib/crsid/host` and `cRSID_free` are the ESP32 port's additions.
 
+The `sid-theremin` build plays cRSID's SID on its own, register by register, with no C64 behind
+it (`src/sid-theremin/sid_chip.h`). `CRSID_SID_ONLY` in `C64/SID.c` is this repository's addition
+for that: it takes out the SID code's one write into C64 memory. Builds that do not define it
+compile exactly as before.
+
 `lib/sidtunes` embeds `.sid` music files for the player to run. The tunes are the work of
 their original C64 composers and are included here only as demo material; they are not
 covered by the cRSID licence.
