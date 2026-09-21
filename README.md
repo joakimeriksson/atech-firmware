@@ -28,7 +28,8 @@ module drivers into `lib/atech_*`. Those drivers are not redistributed here.
 ```
 src/<app>/             one directory per app; main.cpp is what the Atech platform generates
 boards/<name>.yaml     which module sits in which port — the source of truth for wiring
-lib/atech_board/       board builds: variants/<name>.h, rendered from boards/<name>.yaml
+lib/atech_board/       board builds: variants/<name>.h, rendered from boards/<name>.yaml;
+                       measured/ holds what was measured on a board and is shared by variants
 lib/atech_glue/        the hosted-platform glue the SDK does not ship (AtechSerial, UI helpers)
 lib/atech_*/           the real module drivers, synced from the SDK (gitignored)
 lib/crsid, sidtunes       third party, see THIRD-PARTY.md
@@ -54,11 +55,13 @@ below the `measured, not generated` marker and preserved across regeneration.
 ## The physical layout of a module is a board fact
 
 A module's wiring is not always what its API suggests. The Light Grid V1.1 is addressed as a
-nine-LED chain, but the chain is not row-major on the glass: with the module's ESP32 connector
-edge down it runs down the left column, up the middle, then down the right. That was measured on
-the board with the `grid-selftest` build, one LED at a time, and it lives in the board variant as
-`GRID_GLASS` so any app can draw by glass geometry. The esp32sim emulator carries the same map
-from the other side, so what the page draws is what the module shows.
+nine-LED chain, but the chain is not row-major on the glass: with the module's ESP32 connector edge
+down it runs down the left column, up the middle, then down the right. That was measured on the
+board with the `grid-selftest` build, one LED at a time, and it reaches an app through the board
+variant as `GRID_GLASS` so any app can draw by glass geometry. Both boards have their grids in ports
+7 and 11, so the map is one file under `lib/atech_board/measured/` that both variants include. The
+esp32sim emulator carries the same map from the other side, so what the page draws is what the
+module shows.
 
 ## The emulator
 

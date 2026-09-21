@@ -7,7 +7,7 @@ cd "$(dirname "$0")/.."
 PY=.venv/bin/python
 PKG=$($PY -c "import atech,os; print(os.path.dirname(atech.__file__))")
 VER=$($PY -c "import importlib.metadata as m; print(m.version('atech'))")
-for m in speaker st7735_tft rotary_encoder button neopixel; do
+for m in speaker st7735_tft rotary_encoder button neopixel icm40608 distance_sensor; do
   rm -rf lib/atech_$m; mkdir -p lib/atech_$m
   cp "$PKG/catalog/data/modules/$m/"*.h "$PKG/catalog/data/modules/$m/"*.cpp lib/atech_$m/
   echo "synced $m"
