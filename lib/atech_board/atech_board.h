@@ -14,6 +14,8 @@
 
 #if defined(ATECH_BOARD_ATECH14_SYNTH)
 #  include "variants/atech14-synth.h"
+#elif defined(ATECH_BOARD_ATECH14_THEREMIN)
+#  include "variants/atech14-theremin.h"
 #else
 #  error "no board selected: define ATECH_BOARD_<NAME> in the platformio.ini environment"
 #endif

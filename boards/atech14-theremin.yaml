@@ -1,0 +1,39 @@
+# The board build the SID Theremin runs on: the Pocket Synth's board with the two free ports
+# at the bottom right taken by a distance sensor and a 6-axis IMU. Same ports for everything
+# the two boards share, so moving between the builds is a reflash, not a rebuild of the board.
+#
+# Rendered by `make board-headers` into lib/atech_board/variants/atech14-theremin.h.
+# Two I2C modules in two ports are two buses: the SDK's templates put every I2C module on
+# `Wire`, so the header generator moves the second one named here to `Wire1`.
+
+name: atech14-theremin
+board: 14port
+
+modules:
+  - id: rotary_encoder      # Knob V1.1: encoder + 12-LED ring
+    instance: rotary_encoder_1
+    ports: [port_1, port_2]
+  - id: button              # gate: held = sounding
+    instance: button_1
+    port: port_3
+  - id: button              # waveform
+    instance: button_2
+    port: port_4
+  - id: speaker             # MAX98357A I2S amp
+    instance: speaker_1
+    ports: [port_5, port_6]
+  - id: neopixel            # Light Grid V1.1, isolated top-middle slot
+    instance: light_grid_7
+    port: port_7
+  - id: st7735_tft          # 160x80 colour TFT
+    instance: st7735_tft_1
+    ports: [port_9, port_10]
+  - id: neopixel            # Light Grid V1.1, right column
+    instance: light_grid_11
+    port: port_11
+  - id: distance_sensor     # VL53L5CX 8x8 time-of-flight: the hand over it is the pitch
+    instance: distance_sensor_1
+    port: port_13
+  - id: icm40608            # 6-axis IMU: the tilt of the board is the expression
+    instance: imu_1
+    port: port_14

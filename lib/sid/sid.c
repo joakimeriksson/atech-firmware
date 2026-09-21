@@ -169,32 +169,53 @@ static uint16_t osc_output(sid_t *sid, int idx)
     return out;
 }
 
-static void osc_advance(sid_t *sid, int idx)
+// Advance all three oscillators by one output sample, then apply hard sync, then clock the noise.
+//
+// Sync has to see every oscillator's step at once, as the chip does: a voice is reset when its
+// source's MSB rose during this step. Advancing and testing voice by voice gets that wrong for
+// voice 1, whose source, voice 3, has not moved yet when voice 1 looks — its MSB then always equals
+// the prev_msb saved at the end of the last sample, no edge is ever seen, and voice 1 never syncs.
+static void osc_advance_all(sid_t *sid)
 {
-    sid_voice_t *v = &sid->voice[idx];
-    if (v->control & SID_CTRL_TEST) {
-        v->accumulator = 0; // TEST holds the oscillator reset
-        return;
+    uint32_t old_acc[SID_NUM_VOICES], new_acc[SID_NUM_VOICES];
+    bool rising[SID_NUM_VOICES];
+
+    for (int i = 0; i < SID_NUM_VOICES; i++) {
+        sid_voice_t *v = &sid->voice[i];
+        old_acc[i] = v->accumulator;
+        // TEST holds the oscillator reset. `inc` already spans one whole output sample
+        // (freq * clock / sample_rate).
+        v->accumulator = (v->control & SID_CTRL_TEST) ? 0 : (old_acc[i] + v->inc) & 0xffffffu;
+        new_acc[i] = v->accumulator;
+        rising[i] = (new_acc[i] & 0x800000u) != 0 && !v->prev_msb;
     }
 
-    uint32_t old_acc = v->accumulator;
-    // `inc` already spans one whole output sample (freq * clock / sample_rate).
-    v->accumulator = (old_acc + v->inc) & 0xffffffu;
-
-    // Hard sync: reset when the sync-source voice's MSB rose during this step.
-    if (v->control & SID_CTRL_SYNC) {
-        sid_voice_t *src = &sid->voice[(idx + 2) % SID_NUM_VOICES];
-        bool msb = (src->accumulator & 0x800000u) != 0;
-        if (msb && !src->prev_msb) {
-            v->accumulator = 0;
+    for (int i = 0; i < SID_NUM_VOICES; i++) {
+        sid_voice_t *v = &sid->voice[i];
+        int s = (i + 2) % SID_NUM_VOICES;
+        sid_voice_t *src = &sid->voice[s];
+        if (!(v->control & SID_CTRL_SYNC) || (v->control & SID_CTRL_TEST) || !rising[s]) {
+            continue;
         }
+        // As reSID has it: a source that is itself reset in this step does not sync its destination.
+        if ((src->control & SID_CTRL_SYNC) && rising[(s + 2) % SID_NUM_VOICES]) {
+            continue;
+        }
+        // The chip resets at the clock of the edge; a sample is ~22 clocks. Restart the voice from the
+        // part of this sample that came after the edge rather than from the sample's end, or the
+        // reset jitters by up to a sample and the sync tone aliases.
+        uint32_t past = new_acc[s] - 0x800000u;
+        v->accumulator = src->inc ? (uint32_t)(((uint64_t)v->inc * past) / src->inc) & 0xffffffu : 0;
     }
 
     // Clock the noise LFSR once per rising edge of accumulator bit 19.
-    if (v->control & SID_CTRL_NOISE) {
-        uint32_t steps = ((v->accumulator >> 19) - (old_acc >> 19)) & 0x1f;
-        for (uint32_t i = 0; i < steps; i++) {
-            v->noise_lfsr = noise_advance(v->noise_lfsr);
+    for (int i = 0; i < SID_NUM_VOICES; i++) {
+        sid_voice_t *v = &sid->voice[i];
+        if ((v->control & SID_CTRL_NOISE) && !(v->control & SID_CTRL_TEST)) {
+            uint32_t steps = ((v->accumulator >> 19) - (old_acc[i] >> 19)) & 0x1f;
+            for (uint32_t k = 0; k < steps; k++) {
+                v->noise_lfsr = noise_advance(v->noise_lfsr);
+            }
         }
     }
 }
@@ -289,9 +310,7 @@ int16_t sid_sample(sid_t *sid)
     }
 
     // Advance oscillators (one output sample) then clock envelopes per SID clock.
-    for (int i = 0; i < SID_NUM_VOICES; i++) {
-        osc_advance(sid, i);
-    }
+    osc_advance_all(sid);
     for (uint32_t c = 0; c < cycles; c++) {
         for (int i = 0; i < SID_NUM_VOICES; i++) {
             env_clock(&sid->voice[i]);

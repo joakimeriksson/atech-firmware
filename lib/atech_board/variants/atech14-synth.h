@@ -18,6 +18,7 @@
 #include "modules/led/neopixel.h"
 
 RotaryEncoder rotary_encoder_1(5, 4, 9, 8);
+static const int rotary_encoder_1_pin_clk = 5, rotary_encoder_1_pin_dt = 4;
 ButtonModule button_1(17);
 ButtonModule button_2(16);
 Speaker speaker_1(12, 13, 10);
@@ -25,21 +26,5 @@ NeoPixelGrid light_grid_7(6, 7);
 ST7735_TFT st7735_tft_1(2, 41, 1, 40);
 NeoPixelGrid light_grid_11(43, 44);
 // ---- measured, not generated ---------------------------------------------------
-// ---- Physical layout of the Light Grid V1.1 ----------------------------------------------
-// The 3x3 chain is not row-major on the glass: with a module's own ESP32 connector edge down it
-// runs down the left column, up the middle, then down the right. And the two modules are not
-// mounted alike — a slot's side decides how a module sits, so with the motherboard upright
-// (USB-C at the bottom) the port-7 module is turned 180 degrees and the port-11 one 90 degrees.
-// Measured with the grid-selftest build, one chain LED at a time on both grids at once: chain 0
-// is top-left on port 7 and top-right on port 11.
-//
-// GRID_GLASS_*[row * 3 + col] is the chain index lighting that cell, board upright, so a bar
-// drawn by glass geometry stays a bar on the module.
-static const uint8_t GRID_GLASS_PORT7[9]  = { 0, 5, 6, 1, 4, 7, 2, 3, 8 };
-static const uint8_t GRID_GLASS_PORT11[9] = { 2, 1, 0, 3, 4, 5, 8, 7, 6 };
-
-/// Light the cell (row, col) of one grid's glass, rows counted from the top, board upright.
-static inline void gridSetGlassXY(NeoPixelGrid& grid, const uint8_t map[9],
-                                  uint8_t row, uint8_t col, uint8_t r, uint8_t g, uint8_t b) {
-    grid.setPixel(map[row * 3 + col], r, g, b);
-}
+// The Light Grids in ports 7 and 11: chain-to-glass maps, measured with grid-selftest.
+#include "measured/light-grid-v11-ports-7-11.h"
