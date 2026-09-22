@@ -318,6 +318,11 @@ static volatile float   tiltAway = 0.0f, tiltRight = 0.0f;   // -1..+1 of the sp
 static volatile float   rawPitch = 0.0f, rawRoll = 0.0f;     // the driver's angles, for imu_log
 static volatile float   shownNote = 60.0f;                   // MIDI, fractional: the glide without the vibrato
 static volatile uint8_t envelope = 0;
+// What happened after the last times a hand left, for `status`: how long until the gates closed, the
+// envelopes died and the output went quiet, and what was playing. Written by the synth task.
+struct HandLeft { uint32_t atMs, gateOffMs, envelopeOutMs, quietMs; uint8_t mode, instrument, echo; uint16_t echoMs, ring; };
+static HandLeft handLeft[5];
+static volatile int handLeftCount = 0;          // the newest is handLeft[(handLeftCount - 1) % 5]
 static volatile int     outputPeak = 0;                      // largest sample sent to the speaker since the log last asked, of 32767
 static volatile uint32_t audioMaxGapMs = 0;                  // longest wait between two I2S writes; over 46 is a dropout
 
@@ -410,6 +415,17 @@ static void readTilt() {
 /// nearest, and average the rest.
 static float handPos = 0.0f;                     // -1..+1 of the range; the synth task's own, as pitchPos is what it shows
 
+// The last frames the sensor delivered, one entry per frame: when, how many zones were in range,
+// the hand's distance, the note. Frozen when a hand leaves, for `status`: it shows whether the hand
+// walked out through the field, with the note following, or vanished, and how the frames were spaced.
+struct HandFrame { uint32_t ms; uint8_t zones; uint16_t mm; float note; };
+static const int HAND_TRACE = 40;
+static HandFrame handTrace[HAND_TRACE];
+static int handTraceCount = 0;
+static HandFrame leaveTrace[HAND_TRACE];
+static volatile int leaveTraceCount = 0;
+static volatile uint32_t leaveTraceMs = 0;
+
 static void readHand() {
     static float pos = 0.0f;
     static uint32_t lastSeenMs = 0;
@@ -436,8 +452,10 @@ static void readHand() {
         for (int i = 0, v = d; i < 4; i++) { if (v < nearest[i]) { int t = nearest[i]; nearest[i] = v; v = t; } }
     }
     bool wasSeen = handSeen;
+    const bool newFrame = sensorLastFrameMs == millis() && !handStale;
+    int mm = 0;
     if (zones >= HAND_MIN_ZONES) {
-        int mm = zones >= 4 ? (nearest[1] + nearest[2] + nearest[3]) / 3 : (nearest[1] + nearest[2]) / 2;
+        mm = zones >= 4 ? (nearest[1] + nearest[2] + nearest[3]) / 3 : (nearest[1] + nearest[2]) / 2;
         float target = clampf(1.0f - 2.0f * (mm - HAND_NEAR_MM) / (float)(HAND_FAR_MM - HAND_NEAR_MM), -1.0f, 1.0f);
         static const float k = smoothing(1000.0f * CHUNK / SAMPLE_RATE, HAND_SMOOTH_MS);
         pos = wasSeen ? pos + k * (target - pos) : target;   // a hand arriving starts where it is, not where the last one left
@@ -446,6 +464,10 @@ static void readHand() {
     }
     handSeen = zones >= HAND_MIN_ZONES || (wasSeen && millis() - lastSeenMs < HAND_GONE_MS);
     handPos = pos;                                           // held when the hand leaves, so the note dies at its pitch
+    if (newFrame) {
+        handTrace[handTraceCount % HAND_TRACE] = HandFrame{ millis(), (uint8_t) min(zones, 64), (uint16_t) mm, shownNote };
+        handTraceCount++;
+    }
 }
 
 // ---- Voices ---------------------------------------------------------------------------------------
@@ -906,9 +928,28 @@ static void synthTask(void*) {
         // cRSID mixes one chip at a quarter of full scale a voice; twice that still leaves the echo room
         for (int i = 0; i < CHUNK; i++) { buf[i] = (int16_t) constrain(2 * (int)buf[i], -32768, 32767); }
         echo(buf, CHUNK);
-        int peak = outputPeak;
-        for (int i = 0; i < CHUNK; i++) { peak = max(peak, abs((int)buf[i])); }
-        outputPeak = peak;
+        int peak = outputPeak, chunkPeak = 0;
+        for (int i = 0; i < CHUNK; i++) { chunkPeak = max(chunkPeak, abs((int)buf[i])); }
+        outputPeak = max(peak, chunkPeak);
+        // the record of a hand leaving: the gate, the envelope and the output each fall silent in turn
+        static bool handWasSeen = false;
+        const bool handIsSeen = handSeen && !keysOwn;
+        if (handWasSeen && !handIsSeen) {
+            HandLeft& h = handLeft[handLeftCount % 5];
+            h = HandLeft{ millis(), 0, 0, 0, (uint8_t)appliedMode, (uint8_t)appliedInstrument, (uint8_t)echoLevel, (uint16_t)echoMs, (uint16_t)harpDecay };
+            handLeftCount = handLeftCount + 1;
+            int n = min(handTraceCount, HAND_TRACE);         // the frames before this departure, oldest first
+            for (int i = 0; i < n; i++) { leaveTrace[i] = handTrace[(handTraceCount - n + i) % HAND_TRACE]; }
+            leaveTraceCount = n; leaveTraceMs = millis();
+        }
+        handWasSeen = handIsSeen;
+        if (handLeftCount) {
+            HandLeft& h = handLeft[(handLeftCount - 1) % 5];
+            const uint32_t since = millis() - h.atMs;
+            if (!h.gateOffMs && !voiceGate[0] && !voiceGate[1] && !voiceGate[2]) { h.gateOffMs = since ? since : 1; }
+            if (!h.envelopeOutMs && sid.envelope(0) < 8 && sid.envelope(1) < 8 && sid.envelope(2) < 8) { h.envelopeOutMs = since ? since : 1; }
+            if (!h.quietMs && chunkPeak < 300) { h.quietMs = since ? since : 1; }
+        }
         speaker_1.writeSamples(buf, CHUNK);      // blocks on the I2S DMA — that is what paces this task
         uint32_t now = millis();
         if (now - lastWriteMs > audioMaxGapMs) { audioMaxGapMs = now - lastWriteMs; }
@@ -1185,6 +1226,21 @@ static void handleMessage(const char* action, const char* value) {
         Serial.printf("[status] distance sensor: %s, %u frames, the last %lu ms ago%s; hand %s at %d mm\n",
                       handSensor ? "ranging" : "absent", (unsigned)sensorFrames, sensorLastFrameMs ? (unsigned long)(millis() - sensorLastFrameMs) : 0UL,
                       handStale ? " -- STALE, not taken for a hand" : "", handSeen ? "seen" : "none", (int)handMm);
+        for (int i = max(0, (int)handLeftCount - 5); i < handLeftCount; i++) {
+            const HandLeft& h = handLeft[i % 5];
+            Serial.printf("[status] hand left %lu s ago: gates closed +%.2f s, envelopes out +%.2f s, output quiet +%.2f s  (%s, %s, ECHO %u at %u ms, RING %u)\n",
+                          (unsigned long)((millis() - h.atMs) / 1000), h.gateOffMs / 1000.0f, h.envelopeOutMs / 1000.0f, h.quietMs / 1000.0f,
+                          MODE_NAMES[h.mode], INSTRUMENTS[h.instrument].name, h.echo, h.echoMs, h.ring);
+        }
+        if (leaveTraceCount) {
+            Serial.printf("[status] the sensor's frames before the last departure (%lu s ago), oldest first: ms before it / zones in range / mm / note\n",
+                          (unsigned long)((millis() - leaveTraceMs) / 1000));
+            for (int i = max(0, (int)leaveTraceCount - 24); i < leaveTraceCount; i++) {
+                const HandFrame& f = leaveTrace[i];
+                Serial.printf("[trace] -%5ld ms  zones %2u  %4u mm  note %.2f\n", (long)(leaveTraceMs - f.ms), f.zones, f.mm, f.note);
+            }
+        }
+        Serial.printf("[status] volume %d%%, ECHO %d at %d ms\n", (int)lroundf(baseVolume * 100.0f), (int)echoLevel, (int)echoMs);
         Serial.printf("[status] mode %s, knob on %s = %s, instrument %s, last knob use %lu ms ago\n", MODE_NAMES[mode], PARAMS[knobParam].name, value,
                       INSTRUMENTS[instrument].name, adjustedMs ? (unsigned long)(millis() - adjustedMs) : 0UL);
         return;
