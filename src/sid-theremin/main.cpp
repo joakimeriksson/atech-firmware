@@ -20,6 +20,9 @@
 //                                 ARPEGGIO  SPEED  steps a second with the board level
 //                                           ARP    the pattern: UP, DOWN, UPDN, RAND
 //                                           CHORD  TRIAD, 7TH, OCT (octaves), 5TH (fifths and octaves)
+//                               SWEEP, DEPTH   with a synced instrument (LASER HARP, RAT RACE): how fast its
+//                                       sync sweep moves and how far, either side of the instrument's own;
+//                                       the screen shows the time and the octaves that come of it
 //                               RESO    filter resonance, 0..15: 8 leaves each instrument its own
 //                               CHIP    6581, the C64's first SID with its dark, distorting filter, or 8580
 //                               ECHO    how much echo, 0 (off) to 10: louder repeats, and more of them
@@ -41,6 +44,25 @@
 //              steps (in semitones in FREE and CHROMA, gliding with the hand in FREE), without
 //              retriggering, the way C64 tunes fake a chord on one voice
 //
+// Keys. The board is also a MIDI port over Bluetooth LE, "SID Theremin": connect it in the Mac's Audio
+// MIDI Setup (MIDI Studio > Bluetooth) and any MIDI program or keyboard plays it. While keys are
+// held, and for two seconds after, they are the pitch and the hand is not; each mode takes a key as
+// it takes the hand —
+//   THEREMIN   one voice, the last key down sounds, letting it go gives the note back to the one
+//              before; a key pressed while another is held slides to it without a new attack
+//   HARP       every key plucks a string, three ringing at once
+//   FRETS      a key plucks the string; a key pressed while another is held is a hammer-on
+//   ARPEGGIO   the last key is the root (taken to the scale's nearest note, where there is a scale)
+// Keys are not rounded to the SCALE otherwise: a keyboard has its own notes. Every channel is heard.
+// Pitch bend is two semitones; the mod wheel (CC 1) adds vibrato; CC 74 moves the filter as the
+// tilt does; a program change picks the instrument; CC 120 and 123 let every key go.
+//
+// Velocity, the way a C64 player has it, since a SID voice has no level of its own but its envelope:
+// a held note (THEREMIN, ARPEGGIO) sustains lower the softer it is struck, down to a third of the
+// instrument's level, and the level stays while it slides to other keys; a plucked string (HARP,
+// FRETS) is a shorter ring the softer, up to three RING steps; and every note is darker the softer,
+// the filter closing by up to an octave. The hand strikes at full velocity.
+//
 // The SID is cRSID's, the emulation the Pocket Synth's tune player runs, driven register by register
 // as a C64 program drives the chip (sid_chip.h): what an instrument sets is what a tune would set.
 //
@@ -59,8 +81,12 @@
 //   {"action":"set_speed","value":"4"}       arpeggio steps a second, 4..20
 //   {"action":"set_echo","value":"4"}        0..10        {"action":"set_echo_ms","value":"300"}  60..480
 //   {"action":"set_chip","value":"8580"}     6581 or 8580
+//   {"action":"set_sweep","value":"-3"}      the SWEEP setting, -6..6   {"action":"set_depth","value":"2"}  DEPTH, -4..4
 //   {"action":"screen_dump","value":"play"}  what the firmware draws, as 80 rows of RGB565 hex: play, knob, sound,
 //                                            or empty for whichever view is up now
+//   {"action":"note_on","value":"60"}        a key, as if from MIDI; note_off lets it go
+//   {"action":"midi","value":"e0 00 60"}     one MIDI message in hex
+//   {"action":"ble_packet","value":"80 80 90 3c 64"}   a BLE MIDI packet in hex, through the packet parser
 //   {"action":"status","value":""}           the controls as the firmware sees them now, and the settings
 //   {"action":"gate","value":"on"}           button 1 held, from the host: sounds the note with no hand there
 //   {"action":"imu_log","value":"on"}        print the hand distance, the angles, the voices and the timing at
@@ -87,6 +113,8 @@
 #include "modules/input/quadrature_knob.h"
 #include <atech_board.h>
 #include "sid_chip.h"
+#include "midi_in.h"
+#include "ble_midi.h"
 
 AtechSerial serialLink(115200);
 
@@ -124,6 +152,12 @@ static const float SNAP_HYSTERESIS  = 0.25f;  // semitones the tilt must favour 
 static const float VIBRATO_HZ = 5.5f;
 static const uint32_t VIBRATO_RAMP_MS = 500;  // it comes in over this long on a held note, like a player's
 static const float SYNC_TILT_OCTAVES = 0.9f;  // tilting left or right moves the synced voice this far either way
+static const float VELOCITY_FLOOR = 0.33f;    // a held note struck as softly as can be sustains at this share of its level
+static const int   VELOCITY_RING_STEPS = 3;   // a string struck as softly as can be rings this many RING steps shorter
+static const float VELOCITY_OCTAVES = 1.0f;   // and the filter closes by up to this much
+static const uint32_t HAND_STALE_MS = 500;    // no new frame from the distance sensor for this long: whatever it showed is not a hand
+static const uint32_t KEYS_HOLD_MS = 2000;   // after the last key, how long the keys keep the pitch from the hand
+static const float BEND_SEMITONES = 2.0f, MOD_WHEEL_SEMITONES = 0.6f;
 static const uint32_t STRIKE_MS = 20;         // one frame of a 50 Hz C64 player: how long an instrument's strike waveform lasts
 static const uint32_t KNOB_HOLD_MS = 800;
 static const uint32_t ADJUST_SHOW_MS = 1500;  // how long the ring shows a setting after the knob last touched it
@@ -138,13 +172,15 @@ static const uint8_t FRET_REPLUCK_BELOW = 40; // of 255: a string quieter than t
 // What the knob turns, in the order a press steps through them. `modes` is the playing modes a
 // setting belongs to, a bit each: a press skips the settings the mode does not have.
 #define IN_MODE(m) (uint8_t)(1u << (m))
-#define IN_ALL 0xff
+#define IN_ALL 0x7f
+#define IN_SYNC 0xff                             // every mode, but only with an instrument whose voice is synced: see paramShown()
 enum Param { PARAM_NOTE, PARAM_SCALE, PARAM_RANGE, PARAM_VIBRATO, PARAM_RING, PARAM_SPEED, PARAM_PATTERN, PARAM_CHORD,
-             PARAM_RESO, PARAM_ECHO, PARAM_ECHO_TIME, PARAM_CHIP, PARAM_VOL, PARAM_COUNT };
+             PARAM_SWEEP, PARAM_DEPTH, PARAM_RESO, PARAM_ECHO, PARAM_ECHO_TIME, PARAM_CHIP, PARAM_VOL, PARAM_COUNT };
 static const struct { const char* name; uint8_t modes; } PARAMS[PARAM_COUNT] = {
     { "NOTE", IN_ALL }, { "SCALE", IN_ALL }, { "RANGE", IN_ALL }, { "VIBR", IN_MODE(MODE_THEREMIN) },
     { "RING", IN_MODE(MODE_HARP) | IN_MODE(MODE_FRETS) },
     { "SPEED", IN_MODE(MODE_ARP) }, { "ARP", IN_MODE(MODE_ARP) }, { "CHORD", IN_MODE(MODE_ARP) },
+    { "SWEEP", IN_SYNC }, { "DEPTH", IN_SYNC },
     { "RESO", IN_ALL }, { "ECHO", IN_ALL }, { "TIME", IN_ALL }, { "CHIP", IN_ALL }, { "VOL", IN_ALL },
 };
 
@@ -177,12 +213,15 @@ struct Instrument {
     float pulse, pwmDepth, pwmHz;     // pulse width, and its sweep either side
     float vibrato; uint16_t vibratoAfterMs;   // semitones with VIBR at 4; how long the note is held before it starts
     float second; uint8_t secondWave, secondLevel;   // voice 2: frequency against voice 1's (0 = silent), waveform, sustain
-    uint8_t mod; float modRatio, modSweep; uint16_t modSweepMs; float modLfo, modLfoHz;
+    uint8_t mod; float modRatio, modSweep; uint16_t modSweepMs; float modLfo, modLfoHz; uint8_t modTriangle;
                                               // SID_CTRL_RING or _SYNC on voice 1 from voice 3, unheard: their ratio.
                                               // A synced voice is the one whose frequency moves, and the movement is
-                                              // the sound: it starts each note modSweep octaves off the ratio (above
-                                              // it, or below if negative) and comes back over modSweepMs, then keeps
-                                              // sweeping modLfo octaves either side at modLfoHz; the tilt moves it too
+                                              // the sound. Two movements, both counted from the start of the note:
+                                              // a strike, modSweep octaves off the ratio and back over modSweepMs;
+                                              // and an LFO at modLfoHz — a sine, modLfo octaves either side of the
+                                              // ratio, that comes in as the strike dies; or (modTriangle) a triangle
+                                              // that starts at the ratio and goes modLfo octaves up and back, so that
+                                              // every note goes up first and then down. The tilt moves it too
     uint8_t filter; float cutoff, sweep; uint16_t sweepMs;   // SID_FILT_*; octaves above the note; more (or, negative, less) at
                                                              // the strike, dying away over sweepMs
     float wah, wahHz;                 // a slow sweep of the cutoff that never stops: octaves either side, and its rate
@@ -195,25 +234,27 @@ struct Instrument {
 #define PUL SID_CTRL_PULSE
 #define NOI SID_CTRL_NOISE
 static const Instrument INSTRUMENTS[] = {
-    //              wave strike a   d   s   r  pulse  pwm    Hz     vib  after   2nd   wave lvl  mod            ratio  sweep  ms    lfo   Hz    filter       cut   sweep   ms   wah   Hz    res lvl glide
-    { "PWM LEAD",   PUL, 0,    0,  9, 11,  6, 0.45f, 0.35f, 1.1f, 0.25f, 250, 1.006f, PUL,  8,  0,             0.0f,  0.0f,   0, 0.0f,  0.0f, SID_FILT_LP, 2.5f,  0.0f,   0, 0.0f, 0.0f,   5,  8,  0 },   // Hubbard: the wide, restless pulse
-    { "TWANG",      PUL, NOI,  0,  8,  5,  7, 0.25f, 0.15f, 3.0f, 0.20f, 300, 2.0f,   PUL,  3,  0,             0.0f,  0.0f,   0, 0.0f,  0.0f, SID_FILT_LP, 2.0f,  2.0f, 120, 0.0f, 0.0f,   8,  9,  0 },   // Hubbard: a frame of noise, then the note
-    { "HUB BASS",   PUL, NOI,  0,  7,  7,  5, 0.35f, 0.25f, 0.8f, 0.0f,    0, 0.5f,   SAW,  9,  0,             0.0f,  0.0f,   0, 0.0f,  0.0f, SID_FILT_LP, 1.2f,  1.5f, 200, 0.0f, 0.0f,  11,  7,  0 },   // an octave of saw under it, the filter closing
-    { "SAW BRASS",  SAW, 0,    2,  8, 10,  6, 0.5f,  0.0f,  0.0f, 0.20f, 350, 1.005f, SAW,  8,  0,             0.0f,  0.0f,   0, 0.0f,  0.0f, SID_FILT_LP, 1.5f,  2.5f, 350, 0.0f, 0.0f,   7, 11,  0 },   // the filter opens on the strike and settles
-    { "FLUTE",      TRI, 0,    4,  0, 15,  8, 0.5f,  0.0f,  0.0f, 0.35f, 400, 0.0f,   0,    0,  0,             0.0f,  0.0f,   0, 0.0f,  0.0f, 0,           0.0f,  0.0f,   0, 0.0f, 0.0f,   0, 15,  0 },   // Galway: a bare triangle and a late, deep vibrato
-    { "GLASS PAD",  PUL, 0,    9,  0, 15, 11, 0.5f,  0.4f,  0.3f, 0.15f, 600, 1.008f, PUL, 12,  0,             0.0f,  0.0f,   0, 0.0f,  0.0f, SID_FILT_LP, 2.0f,  0.0f,   0, 0.0f, 0.0f,   3,  7,  0 },   // Galway: slow attack, slow pulse sweep, two voices beating
-    { "RING BELL",  TRI, 0,    0, 10,  4, 10, 0.5f,  0.0f,  0.0f, 0.0f,    0, 0.0f,   0,    0,  SID_CTRL_RING, 2.76f, 0.0f,   0, 0.0f,  0.0f, 0,           0.0f,  0.0f,   0, 0.0f, 0.0f,   0, 15,  0 },   // ring modulation at a ratio no harmonic has
+    //              wave strike a   d   s   r  pulse  pwm    Hz     vib  after   2nd   wave lvl  mod            ratio  sweep  ms    lfo   Hz  tri filter       cut   sweep   ms   wah   Hz    res lvl glide
+    { "PWM LEAD",   PUL, 0,    0,  9, 11,  6, 0.45f, 0.35f, 1.1f, 0.25f, 250, 1.006f, PUL,  8,  0,             0.0f,  0.0f,   0, 0.0f,  0.0f, 0, SID_FILT_LP, 2.5f,  0.0f,   0, 0.0f, 0.0f,   5,  8,  0 },   // Hubbard: the wide, restless pulse
+    { "TWANG",      PUL, NOI,  0,  8,  5,  7, 0.25f, 0.15f, 3.0f, 0.20f, 300, 2.0f,   PUL,  3,  0,             0.0f,  0.0f,   0, 0.0f,  0.0f, 0, SID_FILT_LP, 2.0f,  2.0f, 120, 0.0f, 0.0f,   8,  9,  0 },   // Hubbard: a frame of noise, then the note
+    { "HUB BASS",   PUL, NOI,  0,  7,  7,  5, 0.35f, 0.25f, 0.8f, 0.0f,    0, 0.5f,   SAW,  9,  0,             0.0f,  0.0f,   0, 0.0f,  0.0f, 0, SID_FILT_LP, 1.2f,  1.5f, 200, 0.0f, 0.0f,  11,  7,  0 },   // an octave of saw under it, the filter closing
+    { "SAW BRASS",  SAW, 0,    2,  8, 10,  6, 0.5f,  0.0f,  0.0f, 0.20f, 350, 1.005f, SAW,  8,  0,             0.0f,  0.0f,   0, 0.0f,  0.0f, 0, SID_FILT_LP, 1.5f,  2.5f, 350, 0.0f, 0.0f,   7, 11,  0 },   // the filter opens on the strike and settles
+    { "FLUTE",      TRI, 0,    4,  0, 15,  8, 0.5f,  0.0f,  0.0f, 0.35f, 400, 0.0f,   0,    0,  0,             0.0f,  0.0f,   0, 0.0f,  0.0f, 0, 0,           0.0f,  0.0f,   0, 0.0f, 0.0f,   0, 15,  0 },   // Galway: a bare triangle and a late, deep vibrato
+    { "GLASS PAD",  PUL, 0,    9,  0, 15, 11, 0.5f,  0.4f,  0.3f, 0.15f, 600, 1.008f, PUL, 12,  0,             0.0f,  0.0f,   0, 0.0f,  0.0f, 0, SID_FILT_LP, 2.0f,  0.0f,   0, 0.0f, 0.0f,   3,  7,  0 },   // Galway: slow attack, slow pulse sweep, two voices beating
+    { "RING BELL",  TRI, 0,    0, 10,  4, 10, 0.5f,  0.0f,  0.0f, 0.0f,    0, 0.0f,   0,    0,  SID_CTRL_RING, 2.76f, 0.0f,   0, 0.0f,  0.0f, 0, 0,           0.0f,  0.0f,   0, 0.0f, 0.0f,   0, 15,  0 },   // ring modulation at a ratio no harmonic has
     // After the Elka Synthex patch Jarre's laser harp plays: a hard-synced sawtooth whose pitch starts more than two octaves
-    // up and falls for half a second, so every note opens as a bright tear and settles into the note. A second sawtooth
-    // beats against it where the Synthex had its chorus. Made for HARP mode, with ECHO up.
-    { "LASER HARP", SAW, 0,    0, 11,  6, 10, 0.5f,  0.0f,  0.0f, 0.15f, 500, 1.005f, SAW,  5,  SID_CTRL_SYNC, 1.25f, 2.2f, 550, 0.12f, 0.8f, SID_FILT_LP, 4.0f,  0.5f, 600, 0.0f, 0.0f,   3, 10, 45 },
-    { "ORGAN",      PUL, 0,    1,  0, 15,  4, 0.5f,  0.0f,  0.0f, 0.12f, 500, 2.0f,   TRI, 10,  0,             0.0f,  0.0f,   0, 0.0f,  0.0f, SID_FILT_LP, 3.0f,  0.0f,   0, 0.0f, 0.0f,   2, 12,  0 },   // a square and a triangle an octave over it
-    { "WIND",       NOI, 0,    8,  0, 15,  9, 0.5f,  0.0f,  0.0f, 0.0f,    0, 0.0f,   0,    0,  0,             0.0f,  0.0f,   0, 0.0f,  0.0f, SID_FILT_BP, 1.0f,  0.0f,   0, 0.0f, 0.0f,  14, 12,  0 },   // noise through a ringing band-pass that follows the note
+    // up and falls for most of a second, so every note opens as a bright tear and settles into the note; once it has
+    // settled a slow LFO takes over and the note keeps turning. A second sawtooth beats against it where the Synthex had
+    // its chorus. Made for HARP mode, with ECHO up and a long RING.
+    { "LASER HARP", SAW, 0,    0, 11,  6, 10, 0.5f,  0.0f,  0.0f, 0.15f, 500, 1.005f, SAW,  5,  SID_CTRL_SYNC, 1.25f, 2.2f, 800, 0.22f, 0.3f, 0, SID_FILT_LP, 4.0f,  0.5f, 600, 0.0f, 0.0f,   3, 10, 45 },
+    { "ORGAN",      PUL, 0,    1,  0, 15,  4, 0.5f,  0.0f,  0.0f, 0.12f, 500, 2.0f,   TRI, 10,  0,             0.0f,  0.0f,   0, 0.0f,  0.0f, 0, SID_FILT_LP, 3.0f,  0.0f,   0, 0.0f, 0.0f,   2, 12,  0 },   // a square and a triangle an octave over it
+    { "WIND",       NOI, 0,    8,  0, 15,  9, 0.5f,  0.0f,  0.0f, 0.0f,    0, 0.0f,   0,    0,  0,             0.0f,  0.0f,   0, 0.0f,  0.0f, 0, SID_FILT_BP, 1.0f,  0.0f,   0, 0.0f, 0.0f,  14, 12,  0 },   // noise through a ringing band-pass that follows the note
     // In the manner of the lead in Galway's Roland's Rat Race, from memory of the record, not from its data: a sync
-    // sweep. Voice 1, a pulse, is hard-synced to the note and its own frequency is what moves — up into each note from
-    // just above it, then slowly up and down for as long as the note lasts, which is the vowel-like sweep of that lead.
-    // A plain pulse sits under it for the note's body; notes slide into each other and the vibrato comes late and deep.
-    { "RAT RACE",   PUL, 0,    1,  9, 12,  8, 0.5f,  0.2f,  0.5f, 0.30f, 350, 1.004f, PUL,  6,  SID_CTRL_SYNC, 2.0f, -0.9f, 300, 0.75f, 0.45f, SID_FILT_LP, 3.5f,  0.0f,   0, 0.0f, 0.0f,   6,  8, 70 },
+    // sweep. Voice 1, a pulse, is hard-synced to the note and its own frequency is what moves — from just above the note
+    // to three octaves over it, the SID's 3.8 kHz ceiling allowing — as a triangle that starts
+    // again with every note: up first, then down, slowly — over a second each way — and round again while the note lasts. A plain pulse sits
+    // under it for the note's body; notes slide into each other and the vibrato comes late and deep.
+    { "RAT RACE",   PUL, 0,    1,  9, 12,  8, 0.5f,  0.2f,  0.5f, 0.30f, 350, 1.004f, PUL,  6,  SID_CTRL_SYNC, 1.06f, 0.0f,   0, 3.0f, 0.4f, 1, SID_FILT_LP, 3.5f,  0.0f,   0, 0.0f, 0.0f,   6,  8, 70 },
 };
 #undef TRI
 #undef SAW
@@ -249,6 +290,8 @@ static volatile int  arpChord = 0;
 static volatile int  echoLevel = 4;           // 0 is off
 static volatile int  echoMs = 300;
 static volatile int  chipModel = 6581;        // or 8580: the later chip, with a cleaner, stronger filter
+static volatile int  sweepSpeed = 0;          // thirds of an octave of speed on a synced voice's movement, -6..+6; 0 is the instrument's own
+static volatile int  sweepDepth = 0;          // quarters of an octave of depth, -4..+4
 static volatile int  resonance = 8;           // 8 is the instrument's own; either side adds or takes away
 static volatile int  knobParam = PARAM_NOTE;
 static volatile uint32_t adjustedMs = 0;      // when the knob last chose or changed a setting
@@ -256,12 +299,18 @@ static volatile uint32_t knobTurns = 0, knobPresses = 0, button1Presses = 0, but
 static volatile bool recentreRequest = true;  // the first pose read becomes neutral
 static volatile float baseVolume = 0.3f;
 static volatile bool remoteGate = false;
+static volatile bool    keysOwnPitch = false;                // the keys have the pitch, not the hand
+static volatile int     keysDown = 0;
+static volatile uint32_t midiMessages = 0, blePackets = 0;   // since boot, for `status`
+static bool bleStarted = false;
 static volatile uint32_t imuLogMs = 0;        // the period; 0 is off
 static volatile bool gridLog = false;
 
 static volatile bool    imuPresent = false;
 static volatile bool    handSensor = false;                  // the distance sensor has delivered a frame
 static volatile bool    handSeen = false;                    // a hand is in the playing range now
+static volatile bool    handStale = false;                   // the sensor has stopped delivering frames
+static volatile uint32_t sensorFrames = 0, sensorLastFrameMs = 0;   // frames that differed from the one before, and when the last came
 static volatile int     handMm = 0;
 static volatile bool    gateOpen = false;
 static volatile float   pitchPos = 0.0f;                     // -1..+1 of the range, from the hand or the tilt
@@ -359,6 +408,8 @@ static void readTilt() {
 /// How far the hand is, from the 8x8 frame the driver caches. The driver copies distances without
 /// their target status, so a lone zone can be junk: take the four nearest zones in range, drop the
 /// nearest, and average the rest.
+static float handPos = 0.0f;                     // -1..+1 of the range; the synth task's own, as pitchPos is what it shows
+
 static void readHand() {
     static float pos = 0.0f;
     static uint32_t lastSeenMs = 0;
@@ -366,8 +417,20 @@ static void readHand() {
     if (!handSensor) { return; }
     int16_t grid[VL53L5CX_Sensor::GRID_SIZE];
     distance_sensor_1.getDistanceGrid(grid);
+    // The driver caches the last frame it got and has no frame counter: if the sensor stops delivering,
+    // the last frame stays, and a hand in it would sound for as long as the silence lasts. A frame that
+    // differs from the one before is a new one (the sensor's noise sees to that); none for a while, and
+    // what the grid shows is not taken for a hand.
+    static int16_t lastGrid[VL53L5CX_Sensor::GRID_SIZE];
+    if (memcmp(grid, lastGrid, sizeof(grid)) != 0) {
+        memcpy(lastGrid, grid, sizeof(grid));
+        sensorLastFrameMs = millis();
+        sensorFrames = sensorFrames + 1;
+    }
+    handStale = sensorFrames == 0 || millis() - sensorLastFrameMs > HAND_STALE_MS;
     int nearest[4] = { 32767, 32767, 32767, 32767 }, zones = 0;
     for (int16_t d : grid) {
+        if (handStale) { break; }
         if (d < 20 || d > HAND_FAR_MM) { continue; }        // 0 is no target; under 20 mm is the cover glass
         zones++;
         for (int i = 0, v = d; i < 4; i++) { if (v < nearest[i]) { int t = nearest[i]; nearest[i] = v; v = t; } }
@@ -382,7 +445,7 @@ static void readHand() {
         lastSeenMs = millis();
     }
     handSeen = zones >= HAND_MIN_ZONES || (wasSeen && millis() - lastSeenMs < HAND_GONE_MS);
-    pitchPos = pos;                                          // held when the hand leaves, so the note dies at its pitch
+    handPos = pos;                                           // held when the hand leaves, so the note dies at its pitch
 }
 
 // ---- Voices ---------------------------------------------------------------------------------------
@@ -422,7 +485,9 @@ static uint8_t controlFor(int v, const Instrument& inst, bool strings) {
 
 /// A string, struck from wherever its envelope is and left to fade: the next voice in turn, or, where
 /// there is the one string, voices 1 and 2, whose pitch the synth task then sets.
-static void pluck(float note, const Instrument& inst, bool strings) {
+static float pluckVelocity = 1.0f;               // of the latest pluck, 0..1: the filter follows it
+
+static void pluck(float note, const Instrument& inst, bool strings, float velocity = 1.0f) {
     static int next = 0;
     int first = 0, count = inst.second > 0.0f ? 2 : 1;
     if (strings) {
@@ -430,18 +495,25 @@ static void pluck(float note, const Instrument& inst, bool strings) {
         next = (next + 1) % 3;
         sid.setFreqHz(first, noteToHz(note));
     }
+    pluckVelocity = velocity;
+    const int ring = constrain(harpDecay - (int) lroundf(VELOCITY_RING_STEPS * (1.0f - velocity)), 2, 15);   // softer, shorter
     for (int v = first; v < first + count; v++) {
         releaseVoice(v);                         // the gate has to close to open again
+        sid.setAdsr(v, min((int)inst.a, 4), ring, 0, ring);          // before the gate opens: the envelope reads it as it goes
         gateVoice(v, true);
     }
 }
 
-static void setEnvelopes(const Instrument& inst, bool plucked) {
+/// The envelopes for the mode, and for a held note the velocity it was struck with: the sustain
+/// level, scaled down to VELOCITY_FLOOR of the instrument's own. Written before a gate opens.
+static void setEnvelopes(const Instrument& inst, bool plucked, float velocity = 1.0f) {
     if (plucked) {
         for (int v = 0; v < 3; v++) { sid.setAdsr(v, min((int)inst.a, 4), harpDecay, 0, harpDecay); }   // up, then RING down to nothing
     } else {
-        sid.setAdsr(0, inst.a, inst.d, inst.s, inst.r);
-        sid.setAdsr(1, inst.a, inst.d, min(inst.s, inst.secondLevel), inst.r);
+        const float level = VELOCITY_FLOOR + (1.0f - VELOCITY_FLOOR) * velocity;
+        const int s0 = max(1, (int) lroundf(inst.s * level)), s1 = max(1, (int) lroundf(min(inst.s, inst.secondLevel) * level));
+        sid.setAdsr(0, inst.a, inst.d, (uint8_t) s0, inst.r);
+        sid.setAdsr(1, inst.a, inst.d, (uint8_t) s1, inst.r);
     }
 }
 
@@ -460,6 +532,8 @@ static void adjustParam(int clicks) {
     case PARAM_ECHO:    echoLevel = constrain(echoLevel + clicks, 0, 10); break;
     case PARAM_ECHO_TIME: echoMs = constrain(echoMs + 30 * clicks, 60, 480); break;
     case PARAM_CHIP:    chipModel = clicks > 0 ? 8580 : 6581; break;
+    case PARAM_SWEEP:   sweepSpeed = constrain(sweepSpeed + clicks, -6, 6); break;
+    case PARAM_DEPTH:   sweepDepth = constrain(sweepDepth + clicks, -4, 4); break;
     case PARAM_VOL:     baseVolume = constrain(baseVolume + 0.05f * clicks, 0.0f, 1.0f); break;
     }
 }
@@ -479,15 +553,26 @@ static float paramFraction() {
     case PARAM_ECHO:    return echoLevel / 10.0f;
     case PARAM_ECHO_TIME: return (echoMs - 60) / 420.0f;
     case PARAM_CHIP:    return chipModel == 8580 ? 1.0f : 0.0f;
+    case PARAM_SWEEP:   return (sweepSpeed + 6) / 12.0f;
+    case PARAM_DEPTH:   return (sweepDepth + 4) / 8.0f;
     default:            return baseVolume;
     }
 }
 
 /// The setting after `from` that the playing mode has; `from` itself counts when `inclusive`.
+static inline float sweepSpeedFactor() { return powf(2.0f, sweepSpeed / 3.0f); }     // 0.25 .. 4
+static inline float sweepDepthFactor() { return powf(2.0f, sweepDepth / 4.0f); }     // 0.5 .. 2
+
+/// Whether the knob's menu has setting `i` now: the mode's own, and a synced instrument's own.
+static bool paramShown(int i) {
+    if (!(PARAMS[i].modes & IN_MODE(mode))) { return false; }
+    return PARAMS[i].modes != IN_SYNC || INSTRUMENTS[instrument].mod == SID_CTRL_SYNC;
+}
+
 static int nextParam(int from, bool inclusive) {
     for (int i = inclusive ? 0 : 1; i <= PARAM_COUNT; i++) {
         int candidate = (from + i) % PARAM_COUNT;
-        if (PARAMS[candidate].modes & IN_MODE(mode)) { return candidate; }
+        if (paramShown(candidate)) { return candidate; }
     }
     return PARAM_NOTE;
 }
@@ -537,6 +622,56 @@ static void readControls() {
     rotary_encoder_1.wasPressed();               // the edge is handled above
 }
 
+// ---- Keys: MIDI in -----------------------------------------------------------------------------------
+// Messages come from the Bluetooth host's task and from loop() (the serial actions), and are played
+// by the synth task: a queue between them. Everything below the queue belongs to the synth task.
+struct MidiMessage { uint8_t status, d1, d2; };
+static QueueHandle_t midiQueue = nullptr;
+
+static void midiReceive(void*, uint8_t status, uint8_t d1, uint8_t d2) {
+    MidiMessage m = { status, d1, d2 };
+    if (midiQueue && xQueueSend(midiQueue, &m, 0) == pdTRUE) { midiMessages = midiMessages + 1; }
+}
+static void blePacketReceive(const uint8_t* packet, size_t length) {
+    blePackets = blePackets + 1;
+    bleMidiParse(packet, length, midiReceive, nullptr);
+}
+
+static KeyStack keys;
+static struct { uint8_t note, velocity; bool legato; } struck[6];   // the keys that went down since the last look
+static int struckCount = 0;
+static bool keysRetrigger = false;               // a key went down with none held: a new note, not a slide
+static uint32_t keysLastMs = 0;
+static float bendSemis = 0.0f, modWheel = 0.0f, ccBright = 0.0f;
+
+static void readKeys() {
+    struckCount = 0;
+    keysRetrigger = false;
+    MidiMessage m;
+    while (midiQueue && xQueueReceive(midiQueue, &m, 0) == pdTRUE) {
+        const uint8_t type = m.status & 0xF0;    // omni: the channel is not looked at
+        if (type == 0x90 && m.d2 > 0) {
+            if (keys.count == 0) { keysRetrigger = true; }
+            if (struckCount < 6) { struck[struckCount].note = m.d1; struck[struckCount].velocity = m.d2; struck[struckCount].legato = keys.count > 0; struckCount++; }
+            keys.press(m.d1, m.d2);
+            keysLastMs = millis();
+        } else if (type == 0x80 || type == 0x90) {           // a note-on of velocity 0 is a note-off
+            keys.release(m.d1);
+            keysLastMs = millis();
+        } else if (type == 0xE0) {
+            bendSemis = ((int)((m.d2 << 7) | m.d1) - 8192) / 8192.0f * BEND_SEMITONES;
+        } else if (type == 0xB0) {
+            if (m.d1 == 1)        { modWheel = m.d2 / 127.0f; }
+            else if (m.d1 == 74)  { ccBright = clampf((m.d2 - 64) / 63.0f, -1.0f, 1.0f); }
+            else if (m.d1 == 120 || m.d1 == 123) { keys.clear(); }
+        } else if (type == 0xC0) {
+            instrument = m.d1 % INSTRUMENT_COUNT;
+        }
+    }
+    keysDown = keys.count;
+    keysOwnPitch = keys.count > 0 || (keysLastMs != 0 && millis() - keysLastMs < KEYS_HOLD_MS);
+}
+
 // ---- Echo -------------------------------------------------------------------------------------------
 // A feedback delay on the mix, after the SID: the one thing here a C64 could not do, which is why
 // its composers faked it with a second voice playing the tune late and quiet. Each repeat goes
@@ -567,13 +702,15 @@ static void synthTask(void*) {
     static int16_t buf[CHUNK];
     const float blockMs = 1000.0f * BLOCK / SAMPLE_RATE, chunkMs = 1000.0f * CHUNK / SAMPLE_RATE;
     const float TWO_PI_F = 2.0f * (float)M_PI;
-    float note = centreNote, held = centreNote, lfo = 0.0f, pwmLfo = 0.0f, modLfo = 0.0f, wahLfo = 0.0f;
+    float note = centreNote, held = centreNote, lfo = 0.0f, pwmLfo = 0.0f, wahLfo = 0.0f;
     float lastString = -1.0f, arpClockMs = 0.0f, slid = centreNote;
-    uint32_t arpStep = 0, stepMs = 0;           // stepMs: the latest arpeggio step or hammered fret, which a synced voice sweeps into
+    uint32_t arpStep = 0, stepMs = 0;           // stepMs: the latest arpeggio step, hammered fret or key, which a synced voice's strike sweeps into
+    uint32_t noteMs = 0;                        // the same without the arpeggio's steps: where a synced voice's LFO starts from
     int arpTone = 0;
     bool wasPresent = false, wasDrone = false;
     uint32_t lastWriteMs = millis();
     int appliedInstrument = -1, appliedMode = -1, appliedDecay = harpDecay;
+    float noteVelocity = 1.0f, appliedVelocity = -1.0f;   // of the held note; the hand strikes at 1
     bool ringShowsSetting = false;
     uint32_t chunks = 0;
 
@@ -581,7 +718,10 @@ static void synthTask(void*) {
         readTilt();
         readHand();
         readControls();
-        if (!handSensor) { pitchPos = tiltAway; }            // no distance sensor: the tilt is the pitch
+        readKeys();
+        const bool keysOwn = keysOwnPitch;
+        const float bright = clampf(tiltRight + ccBright, -1.0f, 1.0f);   // the tilt to the right, and CC 74
+        const float position = handSensor ? handPos : tiltAway;   // no distance sensor: the tilt is the pitch
 
         if (chipModel != sid.model()) { sid.setModel(chipModel); }
         if (mode != appliedMode) {               // button 1 or the serial link changed it
@@ -598,26 +738,47 @@ static void synthTask(void*) {
             // and strings stop, since the voices may change roles. RING alone leaves strings ringing: their
             // sustain stays 0, which every level can reach
             if (instrument != appliedInstrument) { for (int v = 0; v < 3; v++) { releaseVoice(v); } }
+            if (instrument != appliedInstrument) { sweepSpeed = 0; sweepDepth = 0; knobParam = nextParam(knobParam, true); }
             appliedInstrument = instrument;
             appliedDecay = harpDecay;
+            appliedVelocity = -1.0f;             // written again below, with the held note's velocity
             setEnvelopes(inst, plucked);         // strings already sounding fade at the new rate too
         }
         // with a hand for the pitch, tilting away or towards is the theremin's other antenna: the
         // volume, except in ARPEGGIO, where it is the speed
-        bool tiltIsFree = handSensor;
+        bool tiltIsFree = handSensor || keysOwn;
         float swell = tiltIsFree && appliedMode != MODE_ARP ? powf(2.0f, SWELL_OCTAVES * tiltAway) : 1.0f;
         speaker_1.setVolume(clampf(baseVolume * swell, 0.0f, 0.9f));
 
         // strings and frets are notes, so FREE there is every semitone
         const Scale& scale = SCALES[plucked && scaleIndex == 0 ? 1 : scaleIndex];
-        held = frets ? fretBelow(centreNote + pitchPos * rangeSemis, held, scale)
-                     : snapToScale(centreNote + pitchPos * rangeSemis, held, scale);
+        if (keysOwn) {
+            // a keyboard has its own notes; only an arpeggio's root is taken to the scale, which its chord is built in
+            if (keys.count > 0) { held = appliedMode == MODE_ARP && scale.count ? snapToScale(keys.top(), held, scale) : (float)keys.top(); }
+        } else {
+            held = frets ? fretBelow(centreNote + position * rangeSemis, held, scale)
+                         : snapToScale(centreNote + position * rangeSemis, held, scale);
+        }
+        // written once a pass: loop() draws from it on the other core, and must not see a value on its way
+        pitchPos = keysOwn ? clampf((held - centreNote) / rangeSemis, -1.0f, 1.0f) : position;
         const float glide = smoothing(blockMs, scale.count ? GLIDE_SNAP_MS : GLIDE_FREE_MS);
-        bool playing = droneHeld || handSeen;
+        bool playing = droneHeld || (keysOwn ? keys.count > 0 : handSeen);
+        if (keysRetrigger) { note = held; }      // a new note starts on its pitch
 
         float vibrato = 0.0f, arpNote = held;
         bool arpGlides = false;
-        if (harp) {
+        if (plucked && keysOwn) {
+            // every key plucks; in FRETS a key pressed while another is held is a hammer-on, and letting
+            // it go, a pull-off back to the key still held
+            for (int k = 0; k < struckCount; k++) {
+                bool hammer = frets && struck[k].legato && sid.envelope(0) >= FRET_REPLUCK_BELOW;
+                if (hammer) { stepMs = noteMs = millis(); } else { pluck(struck[k].note, inst, strings, struck[k].velocity / 127.0f); }
+                lastString = struck[k].note;
+            }
+            if (frets && keys.count > 0 && lastString != (float)keys.top()) { lastString = keys.top(); stepMs = noteMs = millis(); }
+            if (droneHeld && !wasDrone) { pluck(held, inst, strings); }
+            wasPresent = false;                  // the hand, when it has the pitch back, arrives afresh
+        } else if (harp) {
             // the hand plucks each string it arrives at; without a distance sensor the tilt always does
             bool present = handSensor ? handSeen : true;
             if ((present && (held != lastString || !wasPresent)) || (droneHeld && !wasDrone)) { pluck(held, inst, strings); }
@@ -630,10 +791,15 @@ static void synthTask(void*) {
             bool present = handSensor ? handSeen : true;
             bool moved = present && held != lastString, quiet = sid.envelope(0) < FRET_REPLUCK_BELOW;
             if ((present && !wasPresent) || (moved && quiet) || (droneHeld && !wasDrone)) { pluck(held, inst, false); }
-            else if (moved) { stepMs = millis(); }
+            else if (moved) { stepMs = noteMs = millis(); }
             if (present) { lastString = held; }
             wasPresent = present;
         } else {
+            if (keysRetrigger && voiceGate[0]) { releaseVoice(0); releaseVoice(1); }   // key up and key down inside one look
+            if (struckCount) { stepMs = noteMs = millis(); } // a synced voice sweeps into every key
+            // a note about to start takes the velocity of what starts it, and keeps it while it slides
+            if (!voiceGate[0] || keysRetrigger) { noteVelocity = keysOwn ? keys.topVelocity() / 127.0f : 1.0f; }
+            if (noteVelocity != appliedVelocity) { appliedVelocity = noteVelocity; setEnvelopes(inst, false, noteVelocity); }
             gateVoice(0, playing);
             gateVoice(1, playing && inst.second > 0.0f);
             gateVoice(2, false);
@@ -667,10 +833,19 @@ static void synthTask(void*) {
 
         // ring and sync: voice 3 runs unheard beside voice 1. Ringing, it is the one off at a ratio; syncing,
         // it holds the note and voice 1 is the one off at a ratio, torn back to the note's period each cycle.
-        // A fixed ratio is a fixed timbre, and a dead one: the synced voice is kept moving, below
-        modLfo += TWO_PI_F * inst.modLfoHz * chunkMs / 1000.0f;
-        if (modLfo > TWO_PI_F) { modLfo -= TWO_PI_F; }
-        const uint32_t sweepFromMs = max(voiceOnMs[0], stepMs);
+        // A fixed ratio is a fixed timbre, and a dead one: the synced voice is kept moving — see Instrument
+        float syncOctaves = 0.0f;
+        if (inst.mod == SID_CTRL_SYNC) {
+            const uint32_t now = millis();
+            const float sinceStrike = (float)(now - max(voiceOnMs[0], stepMs)), sinceNote = (float)(now - max(voiceOnMs[0], noteMs));
+            const float faster = sweepSpeedFactor(), deeper = sweepDepthFactor();     // the SWEEP and DEPTH settings
+            const float strike = inst.modSweepMs ? inst.modSweep * deeper * expf(-sinceStrike * faster / inst.modSweepMs) : 0.0f;
+            const float turn = sinceNote / 1000.0f * inst.modLfoHz * (inst.modTriangle ? faster : 1.0f), phase = turn - floorf(turn);
+            const float wave = inst.modTriangle ? 1.0f - fabsf(2.0f * phase - 1.0f)       // 0 up to 1 and back: from the ratio, up first
+                                                : sinf(TWO_PI_F * phase);
+            const float arrived = inst.modSweepMs ? 1.0f - expf(-sinceNote * faster / inst.modSweepMs) : 1.0f;   // the LFO comes in as the strike dies
+            syncOctaves = strike + inst.modLfo * (inst.modTriangle ? deeper : 1.0f) * wave * arrived + SYNC_TILT_OCTAVES * bright;
+        }
 
         for (int b = 0; b < CHUNK; b += BLOCK) {
             note += glide * (held - note);
@@ -680,14 +855,10 @@ static void synthTask(void*) {
                 float sounding = plucked ? (lastString >= 0.0f ? lastString : held)
                                : appliedMode == MODE_ARP ? (arpGlides ? note + arpNote : arpNote) : note;
                 // portamento, where the instrument has it; a note after a silence starts on its pitch, and so does a string
-                if (inst.glideMs && playing && !plucked) { slid += smoothing(blockMs, inst.glideMs) * (sounding - slid); } else { slid = sounding; }
-                float hz = noteToHz(min(slid + vibrato * sinf(lfo), HIGHEST_NOTE));
-                float modRatio = inst.modRatio;
-                if (inst.mod == SID_CTRL_SYNC) {
-                    float octaves = inst.modSweep * expf(-(float)(millis() - sweepFromMs) / (float)max((int)inst.modSweepMs, 1))
-                                  + SYNC_TILT_OCTAVES * tiltRight + inst.modLfo * sinf(modLfo);
-                    modRatio = clampf(inst.modRatio * powf(2.0f, octaves), 1.02f, 6.0f);   // under 1 the sync has nothing to tear
-                }
+                if (inst.glideMs && playing && !plucked && !keysRetrigger) { slid += smoothing(blockMs, inst.glideMs) * (sounding - slid); } else { slid = sounding; }
+                float hz = noteToHz(min(slid + bendSemis + (vibrato + MOD_WHEEL_SEMITONES * modWheel) * sinf(lfo), HIGHEST_NOTE));
+                // under 1 the sync has nothing to tear
+                const float modRatio = inst.mod == SID_CTRL_SYNC ? clampf(inst.modRatio * powf(2.0f, syncOctaves), 1.02f, 16.0f) : inst.modRatio;
                 sid.setFreqHz(0, inst.mod == SID_CTRL_SYNC ? hz * modRatio : hz);
                 sid.setFreqHz(1, hz * inst.second);
                 sid.setFreqHz(2, inst.mod == SID_CTRL_RING ? hz * modRatio : hz);
@@ -707,7 +878,8 @@ static void synthTask(void*) {
         // voice 3 as a ring or sync source is kept out of the mix the way C64 tunes keep it out: off the
         // filter's input and behind the 3OFF bit. On a 6581 a silent voice is not quite silent
         const bool voice3Unheard = inst.mod && !strings;
-        sid.setFilter(noteToHz(follow) * powf(2.0f, inst.cutoff + 2.0f * tiltRight + sweep),
+        const float softer = VELOCITY_OCTAVES * ((plucked ? pluckVelocity : noteVelocity) - 1.0f);   // 0 at full velocity
+        sid.setFilter(noteToHz(follow) * powf(2.0f, inst.cutoff + 2.0f * bright + sweep + softer),
                       (uint8_t)constrain((int)inst.resonance + resonance - 8, 0, 15),
                       inst.filter ? (voice3Unheard ? 0x03 : 0x07) : 0x00,
                       inst.filter | inst.level | (voice3Unheard ? SID_FILT_3OFF : 0));
@@ -798,6 +970,17 @@ static void paramValue(int param, char* value, size_t size) {
     case PARAM_ECHO:    if (echoLevel) { snprintf(value, size, "%d", (int)echoLevel); } else { snprintf(value, size, "OFF"); } break;
     case PARAM_ECHO_TIME: snprintf(value, size, "%dms", (int)echoMs); break;
     case PARAM_CHIP:    snprintf(value, size, "%d", (int)chipModel); break;
+    case PARAM_SWEEP: {
+        const Instrument& inst = INSTRUMENTS[instrument];
+        float seconds = inst.modTriangle ? 0.5f / (inst.modLfoHz * sweepSpeedFactor()) : inst.modSweepMs / 1000.0f / sweepSpeedFactor();
+        snprintf(value, size, "%.2fs", seconds);
+        break;
+    }
+    case PARAM_DEPTH: {
+        const Instrument& inst = INSTRUMENTS[instrument];
+        snprintf(value, size, "%.1foct", (inst.modTriangle ? inst.modLfo : fabsf(inst.modSweep)) * sweepDepthFactor());
+        break;
+    }
     default:            snprintf(value, size, "%d%%", (int)lroundf(baseVolume * 100.0f)); break;
     }
 }
@@ -853,7 +1036,7 @@ template <class G> static void drawKnobSetting(G& g) {
     char value[12];
     paramValue(param, value, sizeof(value));
     for (int i = 0; i < PARAM_COUNT; i++) {
-        if (!(PARAMS[i].modes & IN_MODE(mode))) { continue; }
+        if (!paramShown(i)) { continue; }
         total++;
         if (i <= param) { index = total; }
     }
@@ -902,11 +1085,12 @@ template <class G> static void drawPlaying(G& g) {
     g.drawLine(58, 58, 58, 61, UI_LABEL);                   // clear of the bottom line's capitals, which start at y 64
     g.fillRect(cents >= 0 ? 58 : 58 + cents, 59, abs(cents) + 1, 2, UI_ACCENT);
 
-    if (handSensor) {                                        // the hand: a marker on a bar, top is nearest
+    const bool keysShown = keysOwnPitch;
+    if (handSensor || keysShown) {                           // the hand, or the key: a marker on a bar, top is highest
         const int hx = 104, hw = 7;
         g.drawRect(hx, by, hw, bs, UI_LABEL);
         int my = by + bs / 2 - (int)(pitchPos * (bs / 2 - 3));
-        g.fillRect(hx + 1, my - 1, hw - 2, 3, handSeen ? UI_ACCENT : 0x39E7);
+        g.fillRect(hx + 1, my - 1, hw - 2, 3, (keysShown ? keysDown > 0 : handSeen) ? UI_ACCENT : 0x39E7);
     }
     g.drawRect(bx, by, bs, bs, UI_LABEL);
     g.drawLine(bx + bs / 2, by + 1, bx + bs / 2, by + bs - 2, 0x39E7);    // dim crosshair
@@ -916,7 +1100,7 @@ template <class G> static void drawPlaying(G& g) {
 
     g.setFont(&FreeSans9pt7b);
     g.setCursor(6, 77);
-    if (imuPresent || handSensor) {
+    if (imuPresent || handSensor || keysShown) {
         // the setting the knob is on, and its value
         int param = knobParam;
         char value[12];
@@ -926,10 +1110,15 @@ template <class G> static void drawPlaying(G& g) {
         g.print(" ");
         g.setTextColor(UI_LABEL);
         g.print(value);
-        g.setFont(nullptr);                       // what the pitch follows, in the built-in 6x8 font
-        g.setTextColor(UI_ACCENT);
-        g.setCursor(130, 68);
-        g.print(handSensor ? "HAND" : "TILT");
+        g.setFont(nullptr);                       // in the built-in 6x8 font: Bluetooth, lit when a host is connected...
+        if (bleStarted) {
+            g.setTextColor(bleMidiConnected() ? UI_VALUE : 0x39E7);
+            g.setCursor(136, 62);
+            g.print("BLE");
+        }
+        g.setTextColor(UI_ACCENT);                // ...and what the pitch follows
+        g.setCursor(130, 71);
+        g.print(keysShown ? "KEYS" : handSensor ? "HAND" : "TILT");
     } else {
         g.setTextColor(ST7735_TFT::COLOR_RED);
         g.print("NO SENSORS: 13, 14");
@@ -960,6 +1149,19 @@ static void drawScreen() {
     framesDrawn = framesDrawn + 1;
 }
 
+/// Hex bytes, "90 3c 64", into `out`; how many there were.
+static size_t hexBytes(const char* text, uint8_t* out, size_t max) {
+    size_t count = 0;
+    while (*text && count < max) {
+        char* end;
+        long byte = strtol(text, &end, 16);
+        if (end == text) { break; }
+        out[count++] = (uint8_t) byte;
+        text = end;
+    }
+    return count;
+}
+
 static void handleMessage(const char* action, const char* value) {
     int n = atoi(value);
     if (strcmp(action, "recenter") == 0)                                  { recentreRequest = true; }
@@ -977,6 +1179,12 @@ static void handleMessage(const char* action, const char* value) {
                       (unsigned long)millis(), (unsigned)framesDrawn, (long)knobTurn.position(), (unsigned)knobTurn.bouncesIgnored(), rotary_encoder_1.isPressed() ? "DOWN" : "up",
                       (unsigned)knobTurns, (unsigned)knobPresses, button_1.isPressed() ? "DOWN" : "up", (unsigned)button1Presses,
                       button_2.isPressed() ? "DOWN" : "up", (unsigned)button2Presses);
+        Serial.printf("[status] Bluetooth MIDI %s; %u packets, %u MIDI messages taken; %d keys down, the pitch is the %s; free heap %u\n",
+                      !bleStarted ? "not started" : bleMidiConnected() ? "connected" : "advertising", (unsigned)blePackets, (unsigned)midiMessages,
+                      (int)keysDown, keysOwnPitch ? "keys'" : "hand's", (unsigned)ESP.getFreeHeap());
+        Serial.printf("[status] distance sensor: %s, %u frames, the last %lu ms ago%s; hand %s at %d mm\n",
+                      handSensor ? "ranging" : "absent", (unsigned)sensorFrames, sensorLastFrameMs ? (unsigned long)(millis() - sensorLastFrameMs) : 0UL,
+                      handStale ? " -- STALE, not taken for a hand" : "", handSeen ? "seen" : "none", (int)handMm);
         Serial.printf("[status] mode %s, knob on %s = %s, instrument %s, last knob use %lu ms ago\n", MODE_NAMES[mode], PARAMS[knobParam].name, value,
                       INSTRUMENTS[instrument].name, adjustedMs ? (unsigned long)(millis() - adjustedMs) : 0UL);
         return;
@@ -997,11 +1205,21 @@ static void handleMessage(const char* action, const char* value) {
         delete shot;
         return;
     }
+    else if (strcmp(action, "note_on") == 0 && n >= 0 && n <= 127)        { midiReceive(nullptr, 0x90, (uint8_t)n, 100); }
+    else if (strcmp(action, "note_off") == 0 && n >= 0 && n <= 127)       { midiReceive(nullptr, 0x80, (uint8_t)n, 0); }
+    else if (strcmp(action, "midi") == 0 || strcmp(action, "ble_packet") == 0) {
+        uint8_t bytes[32];
+        size_t count = hexBytes(value, bytes, sizeof(bytes));
+        if (action[0] == 'b') { bleMidiParse(bytes, count, midiReceive, nullptr); }
+        else if (count >= 1 && (bytes[0] & 0x80)) { midiReceive(nullptr, bytes[0], count > 1 ? bytes[1] : 0, count > 2 ? bytes[2] : 0); }
+    }
     else if (strcmp(action, "gate") == 0)                                 { remoteGate = strcmp(value, "off") != 0; }
     else if (strcmp(action, "imu_log") == 0)                              { imuLogMs = strcmp(value, "off") == 0 ? 0 : constrain(n ? n : 200, 20, 5000); }
     else if (strcmp(action, "set_speed") == 0 && n >= 4 && n <= 20)       { arpSpeed = n; }
     else if (strcmp(action, "set_echo") == 0 && n >= 0 && n <= 10)        { echoLevel = n; }
     else if (strcmp(action, "set_echo_ms") == 0 && n >= 60 && n <= 480)   { echoMs = n; }
+    else if (strcmp(action, "set_sweep") == 0 && n >= -6 && n <= 6)       { sweepSpeed = n; }
+    else if (strcmp(action, "set_depth") == 0 && n >= -4 && n <= 4)       { sweepDepth = n; }
     else if (strcmp(action, "set_chip") == 0 && (n == 6581 || n == 8580)) { chipModel = n; }
     else if (strcmp(action, "grid_log") == 0)                             { gridLog = strcmp(value, "off") != 0; }
     else { Serial.printf("[theremin] ignored %s=%s\n", action, value); return; }
@@ -1046,6 +1264,13 @@ void setup() {
     Serial.printf("[theremin] one screen frame takes %u ms; the I2S DMA holds %u ms of sound\n",
                   (unsigned)(millis() - t0), (unsigned)(8 * 256 * 1000 / SAMPLE_RATE));
 
+    // Bluetooth last of all that allocates: its host and controller take their memory from what is left
+    midiQueue = xQueueCreate(64, sizeof(MidiMessage));
+    uint32_t heapBefore = ESP.getFreeHeap();
+    bleStarted = bleMidiBegin("SID Theremin", blePacketReceive);
+    Serial.printf("[theremin] Bluetooth MIDI %s; it took %u KB of heap, %u KB are free\n", bleStarted ? "advertising as \"SID Theremin\"" : "did not start",
+                  (unsigned)((heapBefore - ESP.getFreeHeap()) / 1024), (unsigned)(ESP.getFreeHeap() / 1024));
+
     // Core 0, above the IMU's poll task: it sleeps in the I2S write most of the time
     xTaskCreatePinnedToCore(synthTask, "Synth", 4096, NULL, 5, NULL, 0);
     Serial.println("[theremin] hold the board flat, USB-C towards you; a hand over the sensor plays, button 1 drones");
@@ -1053,7 +1278,7 @@ void setup() {
 
 void loop() {
     static uint32_t lastLogMs = 0, frames = 0;
-    static int postedWave = -1, postedScale = -1, postedGate = -1, postedMode = -1, postedParam = -1;
+    static int postedWave = -1, postedScale = -1, postedGate = -1, postedMode = -1, postedParam = -1, postedBle = -1;
     static int32_t postedKnob = 0;
 
     serialLink.maintain();
@@ -1063,6 +1288,7 @@ void loop() {
         paramValue(knobParam, value, sizeof(value));
         Serial.printf("[knob] position %ld: %s = %s\n", (long)postedKnob, PARAMS[knobParam].name, value);
     }
+    if (bleStarted && postedBle != (int)bleMidiConnected()) { postedBle = bleMidiConnected(); serialLink.postStateEvent("bluetooth_midi", postedBle ? "connected" : "advertising"); }
     if (postedParam != knobParam) { postedParam = knobParam;   serialLink.postStateEvent("knob_setting", PARAMS[postedParam].name); }
     if (postedMode != mode)       { postedMode = mode;         serialLink.postStateEvent("mode", MODE_NAMES[postedMode]); }
     if (postedWave != instrument) {
@@ -1089,19 +1315,22 @@ void loop() {
         frames++;
     }
     if (logMs && millis() - lastLogMs >= logMs) {
-        Serial.printf("[imu] hand %s %4d mm  pitch %6.1f roll %6.1f -> pos %+.2f away %+.2f right %+.2f note %.2f env %3u/%3u/%3u  voice 1 at %.1f Hz, 3 at %.1f, cutoff %.0f  ctl %02x/%02x/%02x  peak %d\n",
+        Serial.printf("[imu] hand %s %4d mm  pitch %6.1f roll %6.1f -> pos %+.2f away %+.2f right %+.2f note %.2f keys %d env %3u/%3u/%3u  voices %.1f/%.1f/%.1f Hz, cutoff %.0f  ctl %02x/%02x/%02x  adsr %02x%02x/%02x%02x/%02x%02x  peak %d\n",
                       handSensor ? (handSeen ? "seen" : "none") : "n/a ", handMm, rawPitch, rawRoll,
-                      pitchPos, tiltAway, tiltRight, shownNote,
+                      pitchPos, tiltAway, tiltRight, shownNote, (int)keysDown,
                       sid.envelope(0), sid.envelope(1), sid.envelope(2),
-                      sid.freqHz(0), sid.freqHz(2), sid.cutoffHz(),
-                      sid.control(0), sid.control(1), sid.control(2), (int)outputPeak);
+                      sid.freqHz(0), sid.freqHz(1), sid.freqHz(2), sid.cutoffHz(),
+                      sid.control(0), sid.control(1), sid.control(2),
+                      sid.reg(5), sid.reg(6), sid.reg(12), sid.reg(13), sid.reg(19), sid.reg(20), (int)outputPeak);
         outputPeak = 0;
         static uint32_t lastGridFrames = 0;
         uint32_t grids = gridFrames;
-        Serial.printf("[time] screen %.1f fps, grids %.1f Hz, longest gap between I2S writes %u ms (the DMA holds 46)\n",
+        static uint32_t lastSensorFrames = 0;
+        uint32_t sensor = sensorFrames;
+        Serial.printf("[time] screen %.1f fps, grids %.1f Hz, sensor %.1f fps%s, longest gap between I2S writes %u ms (the DMA holds 46)\n",
                       frames * 1000.0f / (millis() - lastLogMs), (grids - lastGridFrames) * 1000.0f / (millis() - lastLogMs),
-                      (unsigned)audioMaxGapMs);
-        lastLogMs = millis(); frames = 0; audioMaxGapMs = 0; lastGridFrames = grids;
+                      (sensor - lastSensorFrames) * 1000.0f / (millis() - lastLogMs), handStale ? " STALE" : "", (unsigned)audioMaxGapMs);
+        lastLogMs = millis(); frames = 0; audioMaxGapMs = 0; lastGridFrames = grids; lastSensorFrames = sensor;
     }
     delay(2);
 }

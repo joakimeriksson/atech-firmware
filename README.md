@@ -11,7 +11,7 @@ A build is an **app** plus a **board**:
 | --- | --- | --- | --- |
 | `pocket-synth` | `src/pocket-synth` | atech14-synth | The Pocket Synth: a SID-chip synth and C64 tune player, TFT UI, knob and buttons, per-voice VU on the light grids |
 | `grid-selftest` | `src/grid-selftest` | atech14-synth | Light Grid bring-up: walks the chain one LED at a time and names where each should appear |
-| `sid-theremin` | `src/sid-theremin` | atech14-theremin | The SID Theremin: a hand over the distance sensor (port 13) is the pitch, the tilt of the board (IMU, port 14) the filter and the volume. Four modes: theremin, harp (the hand plucks the scale's strings), frets (one string, the pitch the fret below the hand), arpeggio; eleven instruments built the way C64 composers built theirs, a Synthex-style laser harp among them, on cRSID's SID (6581 or 8580). Plays with either sensor missing |
+| `sid-theremin` | `src/sid-theremin` | atech14-theremin | The SID Theremin: a hand over the distance sensor (port 13) is the pitch, the tilt of the board (IMU, port 14) the filter and the volume. Four modes: theremin, harp (the hand plucks the scale's strings), frets (one string, the pitch the fret below the hand), arpeggio; eleven instruments built the way C64 composers built theirs, a Synthex-style laser harp among them, on cRSID's SID (6581 or 8580). Also a Bluetooth MIDI port, "SID Theremin": keys play it in every mode (`make keys` is the MacBook's keyboard). Plays with either sensor missing |
 
 ```sh
 make list                      # the builds this repo defines
@@ -70,6 +70,12 @@ These builds run unmodified in [esp32sim](https://github.com/joakimeriksson/esp3
 models the motherboard and its modules. `make dist` produces exactly the three binaries the
 emulator's demo manifests load, and the emulator's golden tests pin the console output, the audio
 and the instruction count for the Pocket Synth build.
+
+The `sid-theremin` build is the exception to "unmodified" in one respect: the emulator models
+neither of its two sensors nor a Bluetooth controller. Without the sensors it runs in its
+no-sensor fallback; starting Bluetooth would hang it, so it is run with the start stubbed out,
+`--elf .pio/build/sid-theremin/firmware.elf --stub bleMidiBegin=0`, and keys are sent as the
+`note_on` / `note_off` / `ble_packet` serial actions, which go through the same code.
 
 ## License
 
