@@ -10,8 +10,9 @@ author" — hence this file. `lib/crsid/host` and `cRSID_free` are the ESP32 por
 
 The `sid-theremin` build plays cRSID's SID on its own, register by register, with no C64 behind
 it (`src/sid-theremin/sid_chip.h`). `CRSID_SID_ONLY` in `C64/SID.c` is this repository's addition
-for that: it takes out the SID code's one write into C64 memory. Builds that do not define it
-compile exactly as before.
+for that: it takes out the SID code's one write into C64 memory. `CRSID_IRAM`, also this
+repository's, puts the SID's two per-sample functions in the ESP32's internal RAM, where the flash
+cache cannot evict them. Builds that define neither compile exactly as before.
 
 `lib/sidtunes` embeds `.sid` music files for the player to run. The tunes are the work of
 their original C64 composers and are included here only as demo material; they are not
