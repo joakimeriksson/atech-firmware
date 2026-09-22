@@ -55,8 +55,13 @@
 //   ARPEGGIO   the last key is the root (taken to the scale's nearest note, where there is a scale)
 // Keys are not rounded to the SCALE otherwise: a keyboard has its own notes. Every channel is heard.
 // Pitch bend is two semitones; the mod wheel (CC 1) adds vibrato; CC 74 moves the filter as the
-// tilt does; a program change picks the instrument; CC 120 and 123 let every key go. Velocity is
-// not used: a SID voice has no level of its own but its envelope.
+// tilt does; a program change picks the instrument; CC 120 and 123 let every key go.
+//
+// Velocity, the way a C64 player has it, since a SID voice has no level of its own but its envelope:
+// a held note (THEREMIN, ARPEGGIO) sustains lower the softer it is struck, down to a third of the
+// instrument's level, and the level stays while it slides to other keys; a plucked string (HARP,
+// FRETS) is a shorter ring the softer, up to three RING steps; and every note is darker the softer,
+// the filter closing by up to an octave. The hand strikes at full velocity.
 //
 // The SID is cRSID's, the emulation the Pocket Synth's tune player runs, driven register by register
 // as a C64 program drives the chip (sid_chip.h): what an instrument sets is what a tune would set.
@@ -147,6 +152,10 @@ static const float SNAP_HYSTERESIS  = 0.25f;  // semitones the tilt must favour 
 static const float VIBRATO_HZ = 5.5f;
 static const uint32_t VIBRATO_RAMP_MS = 500;  // it comes in over this long on a held note, like a player's
 static const float SYNC_TILT_OCTAVES = 0.9f;  // tilting left or right moves the synced voice this far either way
+static const float VELOCITY_FLOOR = 0.33f;    // a held note struck as softly as can be sustains at this share of its level
+static const int   VELOCITY_RING_STEPS = 3;   // a string struck as softly as can be rings this many RING steps shorter
+static const float VELOCITY_OCTAVES = 1.0f;   // and the filter closes by up to this much
+static const uint32_t HAND_STALE_MS = 500;    // no new frame from the distance sensor for this long: whatever it showed is not a hand
 static const uint32_t KEYS_HOLD_MS = 2000;   // after the last key, how long the keys keep the pitch from the hand
 static const float BEND_SEMITONES = 2.0f, MOD_WHEEL_SEMITONES = 0.6f;
 static const uint32_t STRIKE_MS = 20;         // one frame of a 50 Hz C64 player: how long an instrument's strike waveform lasts
@@ -300,6 +309,8 @@ static volatile bool gridLog = false;
 static volatile bool    imuPresent = false;
 static volatile bool    handSensor = false;                  // the distance sensor has delivered a frame
 static volatile bool    handSeen = false;                    // a hand is in the playing range now
+static volatile bool    handStale = false;                   // the sensor has stopped delivering frames
+static volatile uint32_t sensorFrames = 0, sensorLastFrameMs = 0;   // frames that differed from the one before, and when the last came
 static volatile int     handMm = 0;
 static volatile bool    gateOpen = false;
 static volatile float   pitchPos = 0.0f;                     // -1..+1 of the range, from the hand or the tilt
@@ -406,8 +417,20 @@ static void readHand() {
     if (!handSensor) { return; }
     int16_t grid[VL53L5CX_Sensor::GRID_SIZE];
     distance_sensor_1.getDistanceGrid(grid);
+    // The driver caches the last frame it got and has no frame counter: if the sensor stops delivering,
+    // the last frame stays, and a hand in it would sound for as long as the silence lasts. A frame that
+    // differs from the one before is a new one (the sensor's noise sees to that); none for a while, and
+    // what the grid shows is not taken for a hand.
+    static int16_t lastGrid[VL53L5CX_Sensor::GRID_SIZE];
+    if (memcmp(grid, lastGrid, sizeof(grid)) != 0) {
+        memcpy(lastGrid, grid, sizeof(grid));
+        sensorLastFrameMs = millis();
+        sensorFrames = sensorFrames + 1;
+    }
+    handStale = sensorFrames == 0 || millis() - sensorLastFrameMs > HAND_STALE_MS;
     int nearest[4] = { 32767, 32767, 32767, 32767 }, zones = 0;
     for (int16_t d : grid) {
+        if (handStale) { break; }
         if (d < 20 || d > HAND_FAR_MM) { continue; }        // 0 is no target; under 20 mm is the cover glass
         zones++;
         for (int i = 0, v = d; i < 4; i++) { if (v < nearest[i]) { int t = nearest[i]; nearest[i] = v; v = t; } }
@@ -462,7 +485,9 @@ static uint8_t controlFor(int v, const Instrument& inst, bool strings) {
 
 /// A string, struck from wherever its envelope is and left to fade: the next voice in turn, or, where
 /// there is the one string, voices 1 and 2, whose pitch the synth task then sets.
-static void pluck(float note, const Instrument& inst, bool strings) {
+static float pluckVelocity = 1.0f;               // of the latest pluck, 0..1: the filter follows it
+
+static void pluck(float note, const Instrument& inst, bool strings, float velocity = 1.0f) {
     static int next = 0;
     int first = 0, count = inst.second > 0.0f ? 2 : 1;
     if (strings) {
@@ -470,18 +495,25 @@ static void pluck(float note, const Instrument& inst, bool strings) {
         next = (next + 1) % 3;
         sid.setFreqHz(first, noteToHz(note));
     }
+    pluckVelocity = velocity;
+    const int ring = constrain(harpDecay - (int) lroundf(VELOCITY_RING_STEPS * (1.0f - velocity)), 2, 15);   // softer, shorter
     for (int v = first; v < first + count; v++) {
         releaseVoice(v);                         // the gate has to close to open again
+        sid.setAdsr(v, min((int)inst.a, 4), ring, 0, ring);          // before the gate opens: the envelope reads it as it goes
         gateVoice(v, true);
     }
 }
 
-static void setEnvelopes(const Instrument& inst, bool plucked) {
+/// The envelopes for the mode, and for a held note the velocity it was struck with: the sustain
+/// level, scaled down to VELOCITY_FLOOR of the instrument's own. Written before a gate opens.
+static void setEnvelopes(const Instrument& inst, bool plucked, float velocity = 1.0f) {
     if (plucked) {
         for (int v = 0; v < 3; v++) { sid.setAdsr(v, min((int)inst.a, 4), harpDecay, 0, harpDecay); }   // up, then RING down to nothing
     } else {
-        sid.setAdsr(0, inst.a, inst.d, inst.s, inst.r);
-        sid.setAdsr(1, inst.a, inst.d, min(inst.s, inst.secondLevel), inst.r);
+        const float level = VELOCITY_FLOOR + (1.0f - VELOCITY_FLOOR) * velocity;
+        const int s0 = max(1, (int) lroundf(inst.s * level)), s1 = max(1, (int) lroundf(min(inst.s, inst.secondLevel) * level));
+        sid.setAdsr(0, inst.a, inst.d, (uint8_t) s0, inst.r);
+        sid.setAdsr(1, inst.a, inst.d, (uint8_t) s1, inst.r);
     }
 }
 
@@ -606,7 +638,7 @@ static void blePacketReceive(const uint8_t* packet, size_t length) {
 }
 
 static KeyStack keys;
-static struct { uint8_t note; bool legato; } struck[6];      // the keys that went down since the last look
+static struct { uint8_t note, velocity; bool legato; } struck[6];   // the keys that went down since the last look
 static int struckCount = 0;
 static bool keysRetrigger = false;               // a key went down with none held: a new note, not a slide
 static uint32_t keysLastMs = 0;
@@ -620,8 +652,8 @@ static void readKeys() {
         const uint8_t type = m.status & 0xF0;    // omni: the channel is not looked at
         if (type == 0x90 && m.d2 > 0) {
             if (keys.count == 0) { keysRetrigger = true; }
-            if (struckCount < 6) { struck[struckCount].note = m.d1; struck[struckCount].legato = keys.count > 0; struckCount++; }
-            keys.press(m.d1);
+            if (struckCount < 6) { struck[struckCount].note = m.d1; struck[struckCount].velocity = m.d2; struck[struckCount].legato = keys.count > 0; struckCount++; }
+            keys.press(m.d1, m.d2);
             keysLastMs = millis();
         } else if (type == 0x80 || type == 0x90) {           // a note-on of velocity 0 is a note-off
             keys.release(m.d1);
@@ -678,6 +710,7 @@ static void synthTask(void*) {
     bool wasPresent = false, wasDrone = false;
     uint32_t lastWriteMs = millis();
     int appliedInstrument = -1, appliedMode = -1, appliedDecay = harpDecay;
+    float noteVelocity = 1.0f, appliedVelocity = -1.0f;   // of the held note; the hand strikes at 1
     bool ringShowsSetting = false;
     uint32_t chunks = 0;
 
@@ -708,6 +741,7 @@ static void synthTask(void*) {
             if (instrument != appliedInstrument) { sweepSpeed = 0; sweepDepth = 0; knobParam = nextParam(knobParam, true); }
             appliedInstrument = instrument;
             appliedDecay = harpDecay;
+            appliedVelocity = -1.0f;             // written again below, with the held note's velocity
             setEnvelopes(inst, plucked);         // strings already sounding fade at the new rate too
         }
         // with a hand for the pitch, tilting away or towards is the theremin's other antenna: the
@@ -738,7 +772,7 @@ static void synthTask(void*) {
             // it go, a pull-off back to the key still held
             for (int k = 0; k < struckCount; k++) {
                 bool hammer = frets && struck[k].legato && sid.envelope(0) >= FRET_REPLUCK_BELOW;
-                if (hammer) { stepMs = noteMs = millis(); } else { pluck(struck[k].note, inst, strings); }
+                if (hammer) { stepMs = noteMs = millis(); } else { pluck(struck[k].note, inst, strings, struck[k].velocity / 127.0f); }
                 lastString = struck[k].note;
             }
             if (frets && keys.count > 0 && lastString != (float)keys.top()) { lastString = keys.top(); stepMs = noteMs = millis(); }
@@ -763,6 +797,9 @@ static void synthTask(void*) {
         } else {
             if (keysRetrigger && voiceGate[0]) { releaseVoice(0); releaseVoice(1); }   // key up and key down inside one look
             if (struckCount) { stepMs = noteMs = millis(); } // a synced voice sweeps into every key
+            // a note about to start takes the velocity of what starts it, and keeps it while it slides
+            if (!voiceGate[0] || keysRetrigger) { noteVelocity = keysOwn ? keys.topVelocity() / 127.0f : 1.0f; }
+            if (noteVelocity != appliedVelocity) { appliedVelocity = noteVelocity; setEnvelopes(inst, false, noteVelocity); }
             gateVoice(0, playing);
             gateVoice(1, playing && inst.second > 0.0f);
             gateVoice(2, false);
@@ -841,7 +878,8 @@ static void synthTask(void*) {
         // voice 3 as a ring or sync source is kept out of the mix the way C64 tunes keep it out: off the
         // filter's input and behind the 3OFF bit. On a 6581 a silent voice is not quite silent
         const bool voice3Unheard = inst.mod && !strings;
-        sid.setFilter(noteToHz(follow) * powf(2.0f, inst.cutoff + 2.0f * bright + sweep),
+        const float softer = VELOCITY_OCTAVES * ((plucked ? pluckVelocity : noteVelocity) - 1.0f);   // 0 at full velocity
+        sid.setFilter(noteToHz(follow) * powf(2.0f, inst.cutoff + 2.0f * bright + sweep + softer),
                       (uint8_t)constrain((int)inst.resonance + resonance - 8, 0, 15),
                       inst.filter ? (voice3Unheard ? 0x03 : 0x07) : 0x00,
                       inst.filter | inst.level | (voice3Unheard ? SID_FILT_3OFF : 0));
@@ -1144,6 +1182,9 @@ static void handleMessage(const char* action, const char* value) {
         Serial.printf("[status] Bluetooth MIDI %s; %u packets, %u MIDI messages taken; %d keys down, the pitch is the %s; free heap %u\n",
                       !bleStarted ? "not started" : bleMidiConnected() ? "connected" : "advertising", (unsigned)blePackets, (unsigned)midiMessages,
                       (int)keysDown, keysOwnPitch ? "keys'" : "hand's", (unsigned)ESP.getFreeHeap());
+        Serial.printf("[status] distance sensor: %s, %u frames, the last %lu ms ago%s; hand %s at %d mm\n",
+                      handSensor ? "ranging" : "absent", (unsigned)sensorFrames, sensorLastFrameMs ? (unsigned long)(millis() - sensorLastFrameMs) : 0UL,
+                      handStale ? " -- STALE, not taken for a hand" : "", handSeen ? "seen" : "none", (int)handMm);
         Serial.printf("[status] mode %s, knob on %s = %s, instrument %s, last knob use %lu ms ago\n", MODE_NAMES[mode], PARAMS[knobParam].name, value,
                       INSTRUMENTS[instrument].name, adjustedMs ? (unsigned long)(millis() - adjustedMs) : 0UL);
         return;
@@ -1274,19 +1315,22 @@ void loop() {
         frames++;
     }
     if (logMs && millis() - lastLogMs >= logMs) {
-        Serial.printf("[imu] hand %s %4d mm  pitch %6.1f roll %6.1f -> pos %+.2f away %+.2f right %+.2f note %.2f keys %d env %3u/%3u/%3u  voices %.1f/%.1f/%.1f Hz, cutoff %.0f  ctl %02x/%02x/%02x  peak %d\n",
+        Serial.printf("[imu] hand %s %4d mm  pitch %6.1f roll %6.1f -> pos %+.2f away %+.2f right %+.2f note %.2f keys %d env %3u/%3u/%3u  voices %.1f/%.1f/%.1f Hz, cutoff %.0f  ctl %02x/%02x/%02x  adsr %02x%02x/%02x%02x/%02x%02x  peak %d\n",
                       handSensor ? (handSeen ? "seen" : "none") : "n/a ", handMm, rawPitch, rawRoll,
                       pitchPos, tiltAway, tiltRight, shownNote, (int)keysDown,
                       sid.envelope(0), sid.envelope(1), sid.envelope(2),
                       sid.freqHz(0), sid.freqHz(1), sid.freqHz(2), sid.cutoffHz(),
-                      sid.control(0), sid.control(1), sid.control(2), (int)outputPeak);
+                      sid.control(0), sid.control(1), sid.control(2),
+                      sid.reg(5), sid.reg(6), sid.reg(12), sid.reg(13), sid.reg(19), sid.reg(20), (int)outputPeak);
         outputPeak = 0;
         static uint32_t lastGridFrames = 0;
         uint32_t grids = gridFrames;
-        Serial.printf("[time] screen %.1f fps, grids %.1f Hz, longest gap between I2S writes %u ms (the DMA holds 46)\n",
+        static uint32_t lastSensorFrames = 0;
+        uint32_t sensor = sensorFrames;
+        Serial.printf("[time] screen %.1f fps, grids %.1f Hz, sensor %.1f fps%s, longest gap between I2S writes %u ms (the DMA holds 46)\n",
                       frames * 1000.0f / (millis() - lastLogMs), (grids - lastGridFrames) * 1000.0f / (millis() - lastLogMs),
-                      (unsigned)audioMaxGapMs);
-        lastLogMs = millis(); frames = 0; audioMaxGapMs = 0; lastGridFrames = grids;
+                      (sensor - lastSensorFrames) * 1000.0f / (millis() - lastLogMs), handStale ? " STALE" : "", (unsigned)audioMaxGapMs);
+        lastLogMs = millis(); frames = 0; audioMaxGapMs = 0; lastGridFrames = grids; lastSensorFrames = sensor;
     }
     delay(2);
 }

@@ -14,6 +14,7 @@ out like a piano the way music programs do it:
     1 2 3 ... 9 0 -             the instrument (a MIDI program change, 1 = the first)
     left / right arrow          pitch bend down / up while held
     up / down arrow             the mod wheel (vibrato), a step at a time
+    [ / ]                       softer / harder: the velocity the keys play at (a computer keyboard has none)
     space                       let every key go
 
     tools/midi-keys.py                     (or: make keys)
@@ -124,7 +125,7 @@ def window(link, seconds):
     text = tk.StringVar()
     tk.Label(root, textvariable=text, font=("Menlo", 13), justify="left", anchor="w", padx=14, pady=12).pack(fill="both", expand=True)
 
-    state = {"octave": 4, "mod": 0, "program": 0}
+    state = {"octave": 4, "mod": 0, "program": 0, "velocity": 127}
     down = {}                                      # keysym -> the note it started, which an octave change must not lose
     releasing = {}                                 # keysym -> the pending release, for keyboards that repeat as up-down pairs
 
@@ -145,7 +146,7 @@ def window(link, seconds):
             note = 12 * (state["octave"] + 1) + KEY_NOTES[keysym]
             if 0 <= note <= 127:
                 down[keysym] = note
-                link.send(0x90, note, 100)
+                link.send(0x90, note, state["velocity"])
         elif keysym in ("z", "x"):
             state["octave"] = max(0, min(8, state["octave"] + (1 if keysym == "x" else -1)))
         elif keysym in PROGRAM_KEYS:
@@ -157,6 +158,8 @@ def window(link, seconds):
         elif keysym in ("Up", "Down"):
             state["mod"] = max(0, min(127, state["mod"] + (16 if keysym == "Up" else -16)))
             link.send(0xB0, 1, state["mod"])
+        elif keysym in ("bracketleft", "bracketright"):
+            state["velocity"] = max(1, min(127, state["velocity"] + (16 if keysym == "bracketright" else -16)))
         elif keysym == "space":
             down.clear()
             link.send(0xB0, 123, 0)
@@ -178,7 +181,7 @@ def window(link, seconds):
         held = " ".join(f"{NOTE_NAMES[n % 12]}{n // 12 - 1}" for n in down.values() if n is not None)
         text.set(f"Bluetooth: {link.state}\n\n"
                  f"  W E   T Y U   O P        octave {state['octave']} (Z / X)\n"
-                 f" A S D F G H J K L ; '      instrument {state['program'] + 1} (1..9 0 -)   vibrato {state['mod']}\n\n"
+                 f" A S D F G H J K L ; '      instrument {state['program'] + 1} (1..9 0 -)   vibrato {state['mod']}   velocity {state['velocity']} ([ ])\n\n"
                  f"sounding: {held or '-'}")
         root.after(80, refresh)
 

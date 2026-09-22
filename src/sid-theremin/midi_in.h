@@ -52,23 +52,24 @@ static inline void bleMidiParse(const uint8_t* p, size_t n, MidiEmit emit, void*
     }
 }
 
-/// The keys held down, in the order they went down: the last one is the one a single voice plays,
-/// and letting it go gives the note back to the one before it.
+/// The keys held down, in the order they went down, each with the velocity it came with: the last
+/// one is the one a single voice plays, and letting it go gives the note back to the one before it.
 struct KeyStack {
     static const int MAX_KEYS = 10;
-    uint8_t notes[MAX_KEYS];
+    uint8_t notes[MAX_KEYS], velocities[MAX_KEYS];
     int count = 0;
 
     void release(uint8_t note) {
         int kept = 0;
-        for (int i = 0; i < count; i++) { if (notes[i] != note) { notes[kept++] = notes[i]; } }
+        for (int i = 0; i < count; i++) { if (notes[i] != note) { notes[kept] = notes[i]; velocities[kept] = velocities[i]; kept++; } }
         count = kept;
     }
-    void press(uint8_t note) {
+    void press(uint8_t note, uint8_t velocity = 127) {
         release(note);                           // a key cannot be down twice
         if (count == MAX_KEYS) { release(notes[0]); }        // the oldest gives way
-        notes[count++] = note;
+        notes[count] = note; velocities[count] = velocity; count++;
     }
     void clear() { count = 0; }
     uint8_t top() const { return count ? notes[count - 1] : 0; }
+    uint8_t topVelocity() const { return count ? velocities[count - 1] : 127; }
 };
