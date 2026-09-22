@@ -23,6 +23,11 @@
 //                               SWEEP, DEPTH   with a synced instrument (LASER HARP, RAT RACE): how fast its
 //                                       sync sweep moves and how far, either side of the instrument's own;
 //                                       the screen shows the time and the octaves that come of it
+//                               BEAT    a rhythm and bass section on a second SID (rhythm.h): OFF, or one of
+//                                       FOUR, FUNK, HUBBARD, DRIVE, and the soft GALWAY and DRIFT. Four bars
+//                                       of chords in the key of the centre note, the fourth a fill; picking
+//                                       one sets its own tempo, and a new one starts on the next bar
+//                               BPM     its tempo, 60..180
 //                               RESO    filter resonance, 0..15: 8 leaves each instrument its own
 //                               CHIP    6581, the C64's first SID with its dark, distorting filter, or 8580
 //                               ECHO    how much echo, 0 (off) to 10: louder repeats, and more of them
@@ -70,8 +75,9 @@
 // instead of the volume and button 1 is the only gate; without the IMU the filter and the volume
 // stay put. The pose at boot is neutral, so it plays from however it is held when it starts.
 // The screen shows the note, the hand and the tilt; the Light Grids are a meter: a bar as high as
-// the pitch, blue low to red high, as bright as the note is loud, leaning with the tilt; the knob
-// ring points at the pitch within the range.
+// the pitch, blue low to red high, as bright as the note is loud, leaning with the tilt -- and with the
+// rhythm section playing, the top grid shows it instead, a row a voice (drawBeat); the knob ring points
+// at the pitch within the range.
 //
 //   {"action":"recenter","value":""}         neutral = the current pose
 //   {"action":"set_instrument","value":"1"}  0..9        {"action":"set_scale","value":"2"}   0..4
@@ -81,6 +87,8 @@
 //   {"action":"set_speed","value":"4"}       arpeggio steps a second, 4..20
 //   {"action":"set_echo","value":"4"}        0..10        {"action":"set_echo_ms","value":"300"}  60..480
 //   {"action":"set_chip","value":"8580"}     6581 or 8580
+//   {"action":"set_beat","value":"2"}        0 off, 1.. a section   {"action":"set_bpm","value":"110"}  60..180
+//   {"action":"beat_log","value":"on"}       print what the rhythm section plays, step by step
 //   {"action":"set_sweep","value":"-3"}      the SWEEP setting, -6..6   {"action":"set_depth","value":"2"}  DEPTH, -4..4
 //   {"action":"screen_dump","value":"play"}  what the firmware draws, as 80 rows of RGB565 hex: play, knob, sound,
 //                                            or empty for whichever view is up now
@@ -115,6 +123,7 @@
 #include "sid_chip.h"
 #include "midi_in.h"
 #include "ble_midi.h"
+#include "rhythm.h"
 
 AtechSerial serialLink(115200);
 
@@ -174,10 +183,11 @@ static const uint8_t FRET_REPLUCK_BELOW = 40; // of 255: a string quieter than t
 #define IN_MODE(m) (uint8_t)(1u << (m))
 #define IN_ALL 0x7f
 #define IN_SYNC 0xff                             // every mode, but only with an instrument whose voice is synced: see paramShown()
-enum Param { PARAM_NOTE, PARAM_SCALE, PARAM_RANGE, PARAM_VIBRATO, PARAM_RING, PARAM_SPEED, PARAM_PATTERN, PARAM_CHORD,
+enum Param { PARAM_NOTE, PARAM_SCALE, PARAM_RANGE, PARAM_BEAT, PARAM_BPM, PARAM_VIBRATO, PARAM_RING, PARAM_SPEED, PARAM_PATTERN, PARAM_CHORD,
              PARAM_SWEEP, PARAM_DEPTH, PARAM_RESO, PARAM_ECHO, PARAM_ECHO_TIME, PARAM_CHIP, PARAM_VOL, PARAM_COUNT };
 static const struct { const char* name; uint8_t modes; } PARAMS[PARAM_COUNT] = {
-    { "NOTE", IN_ALL }, { "SCALE", IN_ALL }, { "RANGE", IN_ALL }, { "VIBR", IN_MODE(MODE_THEREMIN) },
+    { "NOTE", IN_ALL }, { "SCALE", IN_ALL }, { "RANGE", IN_ALL }, { "BEAT", IN_ALL }, { "BPM", IN_ALL },
+    { "VIBR", IN_MODE(MODE_THEREMIN) },
     { "RING", IN_MODE(MODE_HARP) | IN_MODE(MODE_FRETS) },
     { "SPEED", IN_MODE(MODE_ARP) }, { "ARP", IN_MODE(MODE_ARP) }, { "CHORD", IN_MODE(MODE_ARP) },
     { "SWEEP", IN_SYNC }, { "DEPTH", IN_SYNC },
@@ -289,6 +299,9 @@ static volatile int  arpPattern = ARP_UP;
 static volatile int  arpChord = 0;
 static volatile int  echoLevel = 4;           // 0 is off
 static volatile int  echoMs = 300;
+static volatile int  beatPattern = 0;         // 0: the rhythm section is off; 1.. a pattern
+static volatile int  beatBpm = 120;
+static volatile bool beatLog = false;
 static volatile int  chipModel = 6581;        // or 8580: the later chip, with a cleaner, stronger filter
 static volatile int  sweepSpeed = 0;          // thirds of an octave of speed on a synced voice's movement, -6..+6; 0 is the instrument's own
 static volatile int  sweepDepth = 0;          // quarters of an octave of depth, -4..+4
@@ -318,9 +331,16 @@ static volatile float   tiltAway = 0.0f, tiltRight = 0.0f;   // -1..+1 of the sp
 static volatile float   rawPitch = 0.0f, rawRoll = 0.0f;     // the driver's angles, for imu_log
 static volatile float   shownNote = 60.0f;                   // MIDI, fractional: the glide without the vibrato
 static volatile uint8_t envelope = 0;
+// What happened after the last times a hand left, for `status`: how long until the gates closed, the
+// envelopes died and the output went quiet, and what was playing. Written by the synth task.
+struct HandLeft { uint32_t atMs, gateOffMs, envelopeOutMs, quietMs; uint8_t mode, instrument, echo; uint16_t echoMs, ring; };
+static HandLeft handLeft[5];
+static volatile int handLeftCount = 0;          // the newest is handLeft[(handLeftCount - 1) % 5]
 static volatile int     outputPeak = 0;                      // largest sample sent to the speaker since the log last asked, of 32767
 static volatile uint32_t audioMaxGapMs = 0;                  // longest wait between two I2S writes; over 46 is a dropout
 
+static Rhythm rhythm;                            // SID 2, the rhythm and bass section: see rhythm.h
+static volatile uint32_t leadUs = 0, rhythmUs = 0, busyUs = 0;   // microseconds of the synth task, since the log last asked
 static SidChip sid;                              // cRSID's SID, the one the tune player runs: see sid_chip.h
 
 static inline float clampf(float v, float lo, float hi) { return v < lo ? lo : (v > hi ? hi : v); }
@@ -410,6 +430,17 @@ static void readTilt() {
 /// nearest, and average the rest.
 static float handPos = 0.0f;                     // -1..+1 of the range; the synth task's own, as pitchPos is what it shows
 
+// The last frames the sensor delivered, one entry per frame: when, how many zones were in range,
+// the hand's distance, the note. Frozen when a hand leaves, for `status`: it shows whether the hand
+// walked out through the field, with the note following, or vanished, and how the frames were spaced.
+struct HandFrame { uint32_t ms; uint8_t zones; uint16_t mm; float note; };
+static const int HAND_TRACE = 40;
+static HandFrame handTrace[HAND_TRACE];
+static int handTraceCount = 0;
+static HandFrame leaveTrace[HAND_TRACE];
+static volatile int leaveTraceCount = 0;
+static volatile uint32_t leaveTraceMs = 0;
+
 static void readHand() {
     static float pos = 0.0f;
     static uint32_t lastSeenMs = 0;
@@ -436,8 +467,10 @@ static void readHand() {
         for (int i = 0, v = d; i < 4; i++) { if (v < nearest[i]) { int t = nearest[i]; nearest[i] = v; v = t; } }
     }
     bool wasSeen = handSeen;
+    const bool newFrame = sensorLastFrameMs == millis() && !handStale;
+    int mm = 0;
     if (zones >= HAND_MIN_ZONES) {
-        int mm = zones >= 4 ? (nearest[1] + nearest[2] + nearest[3]) / 3 : (nearest[1] + nearest[2]) / 2;
+        mm = zones >= 4 ? (nearest[1] + nearest[2] + nearest[3]) / 3 : (nearest[1] + nearest[2]) / 2;
         float target = clampf(1.0f - 2.0f * (mm - HAND_NEAR_MM) / (float)(HAND_FAR_MM - HAND_NEAR_MM), -1.0f, 1.0f);
         static const float k = smoothing(1000.0f * CHUNK / SAMPLE_RATE, HAND_SMOOTH_MS);
         pos = wasSeen ? pos + k * (target - pos) : target;   // a hand arriving starts where it is, not where the last one left
@@ -446,6 +479,10 @@ static void readHand() {
     }
     handSeen = zones >= HAND_MIN_ZONES || (wasSeen && millis() - lastSeenMs < HAND_GONE_MS);
     handPos = pos;                                           // held when the hand leaves, so the note dies at its pitch
+    if (newFrame) {
+        handTrace[handTraceCount % HAND_TRACE] = HandFrame{ millis(), (uint8_t) min(zones, 64), (uint16_t) mm, shownNote };
+        handTraceCount++;
+    }
 }
 
 // ---- Voices ---------------------------------------------------------------------------------------
@@ -523,6 +560,13 @@ static void adjustParam(int clicks) {
     case PARAM_NOTE:    centreNote = constrain(centreNote + clicks, CENTRE_MIN, CENTRE_MAX); break;
     case PARAM_SCALE:   scaleIndex = constrain(scaleIndex + clicks, 0, SCALE_COUNT - 1); break;
     case PARAM_RANGE:   rangeSemis = constrain(rangeSemis + 6 * clicks, 6, 24); break;
+    case PARAM_BEAT: {
+        int picked = constrain(beatPattern + clicks, 0, beat::SECTION_COUNT);
+        if (picked != beatPattern && picked > 0) { beatBpm = beat::SECTIONS[picked - 1].bpm; }   // a section brings its tempo
+        beatPattern = picked;
+        break;
+    }
+    case PARAM_BPM:     beatBpm = constrain(beatBpm + 2 * clicks, 60, 180); break;
     case PARAM_VIBRATO: vibratoSteps = constrain(vibratoSteps + clicks, 0, 10); break;
     case PARAM_RING:    harpDecay = constrain(harpDecay + clicks, 7, 13); break;
     case PARAM_SPEED:   arpSpeed = constrain(arpSpeed + clicks, 4, 20); break;
@@ -544,6 +588,8 @@ static float paramFraction() {
     case PARAM_NOTE:    return (centreNote - CENTRE_MIN) / (float)(CENTRE_MAX - CENTRE_MIN);
     case PARAM_SCALE:   return scaleIndex / (float)(SCALE_COUNT - 1);
     case PARAM_RANGE:   return (rangeSemis - 6) / 18.0f;
+    case PARAM_BEAT:    return beatPattern / (float) beat::SECTION_COUNT;
+    case PARAM_BPM:     return (beatBpm - 60) / 120.0f;
     case PARAM_VIBRATO: return vibratoSteps / 10.0f;
     case PARAM_RING:    return (harpDecay - 7) / 6.0f;
     case PARAM_SPEED:   return (arpSpeed - 4) / 16.0f;
@@ -724,6 +770,12 @@ static void synthTask(void*) {
         const float position = handSensor ? handPos : tiltAway;   // no distance sensor: the tilt is the pitch
 
         if (chipModel != sid.model()) { sid.setModel(chipModel); }
+        const uint32_t busyFrom = micros();
+        rhythm.setModel(chipModel);
+        if (beatPattern > 0) { rhythm.setSection(beatPattern - 1); }
+        rhythm.setTempo(beatBpm);
+        rhythm.setKey(centreNote - 24);
+        rhythm.setRunning(beatPattern > 0);
         if (mode != appliedMode) {               // button 1 or the serial link changed it
             appliedMode = mode;
             appliedInstrument = -1;              // the envelopes are the mode's as much as the instrument's
@@ -863,7 +915,9 @@ static void synthTask(void*) {
                 sid.setFreqHz(1, hz * inst.second);
                 sid.setFreqHz(2, inst.mod == SID_CTRL_RING ? hz * modRatio : hz);
             }
+            const uint32_t renderFrom = micros();
             sid.render(buf + b, BLOCK);
+            leadUs += micros() - renderFrom;
         }
 
         // the filter follows the note, so a tilt means the same brightness anywhere in the range: the
@@ -906,9 +960,43 @@ static void synthTask(void*) {
         // cRSID mixes one chip at a quarter of full scale a voice; twice that still leaves the echo room
         for (int i = 0; i < CHUNK; i++) { buf[i] = (int16_t) constrain(2 * (int)buf[i], -32768, 32767); }
         echo(buf, CHUNK);
-        int peak = outputPeak;
-        for (int i = 0; i < CHUNK; i++) { peak = max(peak, abs((int)buf[i])); }
-        outputPeak = peak;
+        // SID 2 after the echo, which is the lead's alone: the rhythm stays dry and tight. The two together
+        // can go past full scale, so the top of the range bends rather than clips
+        static int16_t beatBuf[CHUNK];
+        const uint32_t rhythmFrom = micros();
+        if (rhythm.render(beatBuf, CHUNK)) {
+            const int KNEE = 24000;
+            for (int i = 0; i < CHUNK; i++) {
+                int x = (int)buf[i] + (int)beatBuf[i];      // at the lead's own scale, which sits it just under a played note
+                int m = abs(x);
+                if (m > KNEE) { m = KNEE + (int)((m - KNEE) / (1.0f + (m - KNEE) / (32767.0f - KNEE))); x = x < 0 ? -m : m; }
+                buf[i] = (int16_t) constrain(x, -32767, 32767);
+            }
+        }
+        rhythmUs += micros() - rhythmFrom;
+        int peak = outputPeak, chunkPeak = 0;
+        for (int i = 0; i < CHUNK; i++) { chunkPeak = max(chunkPeak, abs((int)buf[i])); }
+        outputPeak = max(peak, chunkPeak);
+        // the record of a hand leaving: the gate, the envelope and the output each fall silent in turn
+        static bool handWasSeen = false;
+        const bool handIsSeen = handSeen && !keysOwn;
+        if (handWasSeen && !handIsSeen) {
+            HandLeft& h = handLeft[handLeftCount % 5];
+            h = HandLeft{ millis(), 0, 0, 0, (uint8_t)appliedMode, (uint8_t)appliedInstrument, (uint8_t)echoLevel, (uint16_t)echoMs, (uint16_t)harpDecay };
+            handLeftCount = handLeftCount + 1;
+            int n = min(handTraceCount, HAND_TRACE);         // the frames before this departure, oldest first
+            for (int i = 0; i < n; i++) { leaveTrace[i] = handTrace[(handTraceCount - n + i) % HAND_TRACE]; }
+            leaveTraceCount = n; leaveTraceMs = millis();
+        }
+        handWasSeen = handIsSeen;
+        if (handLeftCount) {
+            HandLeft& h = handLeft[(handLeftCount - 1) % 5];
+            const uint32_t since = millis() - h.atMs;
+            if (!h.gateOffMs && !voiceGate[0] && !voiceGate[1] && !voiceGate[2]) { h.gateOffMs = since ? since : 1; }
+            if (!h.envelopeOutMs && sid.envelope(0) < 8 && sid.envelope(1) < 8 && sid.envelope(2) < 8) { h.envelopeOutMs = since ? since : 1; }
+            if (!h.quietMs && chunkPeak < 300) { h.quietMs = since ? since : 1; }
+        }
+        busyUs += micros() - busyFrom;
         speaker_1.writeSamples(buf, CHUNK);      // blocks on the I2S DMA — that is what paces this task
         uint32_t now = millis();
         if (now - lastWriteMs > audioMaxGapMs) { audioMaxGapMs = now - lastWriteMs; }
@@ -927,14 +1015,14 @@ static void hueToRgb(float hue, float value, uint8_t* r, uint8_t* g, uint8_t* b)
     *b = (uint8_t)(rgb[sector][2] * value * 255.0f);
 }
 
-/// Both grids as one meter of what is sounding, drawn by glass geometry so both show it the same
-/// way round. The bar's height is the pitch within the range, filling from the bottom row with
-/// the top lit row fading in, as the Pocket Synth's VU does; its colour runs from blue at the
-/// bottom of the range to red at the top; its brightness is the envelope, so it lights when a
-/// note sounds and dies away with it. Tilting left or right leans the bar to that side's columns.
+/// A grid as a meter of the lead, drawn by glass geometry so both grids show it the same way round. The
+/// bar's height is the pitch within the range, filling from the bottom row with the top lit row fading
+/// in, as the Pocket Synth's VU does; its colour runs from blue at the bottom of the range to red at the
+/// top; its brightness is the envelope, so it lights when a note sounds and dies away with it. Tilting
+/// left or right leans the bar to that side's columns.
 static volatile uint32_t gridFrames = 0;
 
-static void drawGrids() {
+static void drawLead(NeoPixelGrid& grid, const uint8_t map[9]) {
     float range = (pitchPos + 1.0f) * 0.5f;                  // 0..1 of the playing range
     float height = 0.5f + 2.5f * range;                      // rows lit: the lowest note still shows half a row
     // a trace when silent, so the board does not look off. The grid driver scales everything by its
@@ -947,10 +1035,65 @@ static void drawGrids() {
             float side = clampf(1.0f - fabsf(lean) * fabsf(1.0f + lean - col) * 0.5f, 0.0f, 1.0f);
             uint8_t r, g, b;
             hueToRgb(0.66f * (1.0f - range), value * lit * side, &r, &g, &b);
-            gridSetGlassXY(light_grid_7,  GRID_GLASS_PORT7,  row, col, r, g, b);
-            gridSetGlassXY(light_grid_11, GRID_GLASS_PORT11, row, col, r, g, b);
+            gridSetGlassXY(grid, map, row, col, r, g, b);
         }
     }
+}
+
+/// A grid as the rhythm section, a row a SID voice, each lit by its own envelope, so the lights move as
+/// the sound does. The bottom row is the bass, in the colour of its note. The middle row the drums: the
+/// kick an orange flash across it, the snare white, the soft boom deep blue, the tick a spark in the
+/// middle, the echo a dim ghost of the arpeggio. The top row the hi-hats, stepping across it in cyan, or
+/// the arpeggio, rippling left to right and back in the colour of each note. A strike lights its row
+/// for a frame or two however short its sound: a 48 ms hi-hat can fall between two looks at 20 Hz.
+static void drawBeat(NeoPixelGrid& grid, const uint8_t map[9]) {
+    static uint32_t seen[3] = { 0, 0, 0 };
+    static float flash[3] = { 0, 0, 0 };
+    float level[3];
+    for (int v = 0; v < 3; v++) {
+        if (rhythm.shown[v].strikes != seen[v]) { seen[v] = rhythm.shown[v].strikes; flash[v] = 1.0f; } else { flash[v] *= 0.45f; }
+        level[v] = max(rhythm.envelope(v) / 255.0f, flash[v]);
+    }
+    static const uint8_t RIPPLE[6] = { 0, 1, 2, 2, 1, 0 };   // the arpeggio's up-and-down, as a column
+    uint8_t rgb[3][3][3] = {};                               // [row][col][r, g, b]
+    auto paint = [&](int row, int col, float hueOrMinus, const uint8_t fixed[3], float value) {
+        uint8_t r, g, b;
+        if (hueOrMinus >= 0.0f) { hueToRgb(hueOrMinus, value, &r, &g, &b); }
+        else { r = (uint8_t)(fixed[0] * value); g = (uint8_t)(fixed[1] * value); b = (uint8_t)(fixed[2] * value); }
+        rgb[row][col][0] = max(rgb[row][col][0], r); rgb[row][col][1] = max(rgb[row][col][1], g); rgb[row][col][2] = max(rgb[row][col][2], b);
+    };
+    auto pitchHue = [](int note) { return note < 0 ? 0.0f : (float)(note % 12) / 12.0f; };
+    static const uint8_t KICK[3] = { 255, 70, 0 }, SNARE[3] = { 255, 225, 180 }, BOOM[3] = { 40, 70, 255 },
+                         TICK[3] = { 190, 190, 255 }, HAT[3] = { 0, 200, 255 };
+
+    const Rhythm::Shown& bass = rhythm.shown[0];             // the bottom row: the bass, with a glow between notes
+    for (int col = 0; col < 3; col++) { paint(2, col, pitchHue(bass.note), nullptr, 0.08f + 0.85f * level[0]); }
+
+    const Rhythm::Shown& mid = rhythm.shown[1];              // the middle row: kick, snare, boom, tick, echo
+    for (int col = 0; col < 3; col++) {
+        if (mid.what == 'k') { paint(1, col, -1.0f, KICK, level[1]); }
+        else if (mid.what == 's') { paint(1, col, -1.0f, SNARE, level[1]); }
+        else if (mid.what == 'b') { paint(1, col, -1.0f, BOOM, 0.7f * level[1]); }
+    }
+    if (mid.what == 't') { paint(1, 1, -1.0f, TICK, 0.6f * level[1]); }
+    if (mid.what == 'e') { paint(1, RIPPLE[mid.pos % 6], pitchHue(mid.note), nullptr, 0.45f * level[1]); }
+
+    const Rhythm::Shown& top = rhythm.shown[2];              // the top row: hi-hats or the arpeggio
+    if (top.what == 'h') { paint(0, top.pos % 3, -1.0f, HAT, level[2]); }
+    else if (top.what == 'o') { for (int col = 0; col < 3; col++) { paint(0, col, -1.0f, HAT, level[2]); } }
+    else if (top.what == 'a') {
+        const int col = RIPPLE[top.pos % 6];
+        paint(0, col, pitchHue(top.note), nullptr, level[2]);
+        for (int side = col - 1; side <= col + 1; side += 2) { if (side >= 0 && side < 3) { paint(0, side, pitchHue(top.note), nullptr, 0.2f * level[2]); } }
+    }
+    for (int row = 0; row < 3; row++) { for (int col = 0; col < 3; col++) { gridSetGlassXY(grid, map, row, col, rgb[row][col][0], rgb[row][col][1], rgb[row][col][2]); } }
+}
+
+/// With the rhythm section playing, the grid by the distance sensor (port 11) is the lead your hand plays
+/// and the one at the top (port 7) the rhythm; without it, both are the lead.
+static void drawGrids() {
+    drawLead(light_grid_11, GRID_GLASS_PORT11);
+    if (rhythm.active()) { drawBeat(light_grid_7, GRID_GLASS_PORT7); } else { drawLead(light_grid_7, GRID_GLASS_PORT7); }
     light_grid_7.show();
     light_grid_11.show();
     gridFrames = gridFrames + 1;
@@ -961,6 +1104,8 @@ static void paramValue(int param, char* value, size_t size) {
     case PARAM_NOTE:    snprintf(value, size, "%s%d", NOTE_NAMES[centreNote % 12], centreNote / 12 - 1); break;
     case PARAM_SCALE:   snprintf(value, size, "%s", SCALES[scaleIndex].name); break;
     case PARAM_RANGE:   snprintf(value, size, "+-%d", (int)rangeSemis); break;
+    case PARAM_BEAT:    snprintf(value, size, "%s", beatPattern ? beat::SECTIONS[beatPattern - 1].name : "OFF"); break;
+    case PARAM_BPM:     snprintf(value, size, "%d", (int)beatBpm); break;
     case PARAM_VIBRATO: snprintf(value, size, "x%.2f", vibratoSteps / 4.0f); break;
     case PARAM_RING:    snprintf(value, size, "%s", RING_TIMES[harpDecay - 7]); break;
     case PARAM_SPEED:   snprintf(value, size, "%d/s", (int)arpSpeed); break;
@@ -1185,6 +1330,21 @@ static void handleMessage(const char* action, const char* value) {
         Serial.printf("[status] distance sensor: %s, %u frames, the last %lu ms ago%s; hand %s at %d mm\n",
                       handSensor ? "ranging" : "absent", (unsigned)sensorFrames, sensorLastFrameMs ? (unsigned long)(millis() - sensorLastFrameMs) : 0UL,
                       handStale ? " -- STALE, not taken for a hand" : "", handSeen ? "seen" : "none", (int)handMm);
+        for (int i = max(0, (int)handLeftCount - 5); i < handLeftCount; i++) {
+            const HandLeft& h = handLeft[i % 5];
+            Serial.printf("[status] hand left %lu s ago: gates closed +%.2f s, envelopes out +%.2f s, output quiet +%.2f s  (%s, %s, ECHO %u at %u ms, RING %u)\n",
+                          (unsigned long)((millis() - h.atMs) / 1000), h.gateOffMs / 1000.0f, h.envelopeOutMs / 1000.0f, h.quietMs / 1000.0f,
+                          MODE_NAMES[h.mode], INSTRUMENTS[h.instrument].name, h.echo, h.echoMs, h.ring);
+        }
+        if (leaveTraceCount) {
+            Serial.printf("[status] the sensor's frames before the last departure (%lu s ago), oldest first: ms before it / zones in range / mm / note\n",
+                          (unsigned long)((millis() - leaveTraceMs) / 1000));
+            for (int i = max(0, (int)leaveTraceCount - 24); i < leaveTraceCount; i++) {
+                const HandFrame& f = leaveTrace[i];
+                Serial.printf("[trace] -%5ld ms  zones %2u  %4u mm  note %.2f\n", (long)(leaveTraceMs - f.ms), f.zones, f.mm, f.note);
+            }
+        }
+        Serial.printf("[status] volume %d%%, ECHO %d at %d ms\n", (int)lroundf(baseVolume * 100.0f), (int)echoLevel, (int)echoMs);
         Serial.printf("[status] mode %s, knob on %s = %s, instrument %s, last knob use %lu ms ago\n", MODE_NAMES[mode], PARAMS[knobParam].name, value,
                       INSTRUMENTS[instrument].name, adjustedMs ? (unsigned long)(millis() - adjustedMs) : 0UL);
         return;
@@ -1220,6 +1380,12 @@ static void handleMessage(const char* action, const char* value) {
     else if (strcmp(action, "set_echo_ms") == 0 && n >= 60 && n <= 480)   { echoMs = n; }
     else if (strcmp(action, "set_sweep") == 0 && n >= -6 && n <= 6)       { sweepSpeed = n; }
     else if (strcmp(action, "set_depth") == 0 && n >= -4 && n <= 4)       { sweepDepth = n; }
+    else if (strcmp(action, "set_beat") == 0 && n >= 0 && n <= beat::SECTION_COUNT) {
+        if (n > 0 && n != beatPattern) { beatBpm = beat::SECTIONS[n - 1].bpm; }
+        beatPattern = n;
+    }
+    else if (strcmp(action, "beat_log") == 0)                             { beatLog = strcmp(value, "off") != 0; }
+    else if (strcmp(action, "set_bpm") == 0 && n >= 60 && n <= 180)       { beatBpm = n; }
     else if (strcmp(action, "set_chip") == 0 && (n == 6581 || n == 8580)) { chipModel = n; }
     else if (strcmp(action, "grid_log") == 0)                             { gridLog = strcmp(value, "off") != 0; }
     else { Serial.printf("[theremin] ignored %s=%s\n", action, value); return; }
@@ -1257,6 +1423,7 @@ void setup() {
                   distance_sensor_1.isReady() ? "ranging" : "not found, so the tilt away/towards is the pitch");
 
     if (!sid.begin(SAMPLE_RATE, chipModel)) { Serial.println("[theremin] no memory for the SID: no sound"); for (;;) { delay(1000); } }
+    if (!rhythm.begin(SAMPLE_RATE, chipModel)) { Serial.println("[theremin] no memory for the second SID: no rhythm section"); }
     // the synth task sets the envelopes and the waveform when it enters the first mode
 
     uint32_t t0 = millis();
@@ -1282,6 +1449,15 @@ void loop() {
     static int32_t postedKnob = 0;
 
     serialLink.maintain();
+    static uint32_t beatPrinted = 0;
+    if (!beatLog) { beatPrinted = rhythm.eventCount; }
+    while (beatPrinted < rhythm.eventCount) {
+        if (rhythm.eventCount - beatPrinted > 32) { beatPrinted = rhythm.eventCount - 32; }   // the ring has moved on
+        const beat::Event e = rhythm.events[beatPrinted % 32];
+        Serial.printf("[beat] #%lu bar %u step %2u  bass %4d  v2 %c %4d  v3 %c %4d\n", (unsigned long)e.n, e.bar + 1, e.step,
+                      e.bass == beat::R ? -1 : e.bass, e.drum, e.drumNote, e.top, e.topNote);
+        beatPrinted++;
+    }
     if (postedKnob != knobTurn.position()) {
         postedKnob = knobTurn.position();
         char value[12];
@@ -1327,9 +1503,14 @@ void loop() {
         uint32_t grids = gridFrames;
         static uint32_t lastSensorFrames = 0;
         uint32_t sensor = sensorFrames;
+        const float spanUs = (millis() - lastLogMs) * 1000.0f;
         Serial.printf("[time] screen %.1f fps, grids %.1f Hz, sensor %.1f fps%s, longest gap between I2S writes %u ms (the DMA holds 46)\n",
                       frames * 1000.0f / (millis() - lastLogMs), (grids - lastGridFrames) * 1000.0f / (millis() - lastLogMs),
                       (sensor - lastSensorFrames) * 1000.0f / (millis() - lastLogMs), handStale ? " STALE" : "", (unsigned)audioMaxGapMs);
+        Serial.printf("[cpu] synth task %.1f%% of its core: lead SID %.1f%%, rhythm SID %.1f%% (%s)\n",
+                      100.0f * busyUs / spanUs, 100.0f * leadUs / spanUs, 100.0f * rhythmUs / spanUs,
+                      beatPattern ? beat::SECTIONS[beatPattern - 1].name : "off");
+        busyUs = leadUs = rhythmUs = 0;
         lastLogMs = millis(); frames = 0; audioMaxGapMs = 0; lastGridFrames = grids; lastSensorFrames = sensor;
     }
     delay(2);

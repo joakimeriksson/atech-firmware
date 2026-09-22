@@ -3,6 +3,8 @@
 #include <math.h>
 #include <stdlib.h>
 #include <libcRSID.h>
+#include "esp_attr.h"
+
 
 namespace {
 #include "C64/SID.h"                             // cRSID's tables; only the two cutoff curves are used here
@@ -90,15 +92,25 @@ float SidChip::cutoffHz() const {
 
 uint8_t SidChip::envelope(int voice) const { return _sid->EnvelopeCounter[voice * 7]; }
 
-void SidChip::render(int16_t* buf, size_t frames) {
+IRAM_ATTR void SidChip::render(int16_t* buf, size_t frames) {
     for (size_t i = 0; i < frames; i++) {
-        // the envelopes run on SID clocks, ~22 a sample; in steps of at most 7, as the 6502's
-        // instructions give them in the player, since the fastest envelope rate is 9 clocks a step
+        // The envelopes run on SID clocks, ~22 a sample. cRSID's envelope counter fires when a step lands in
+        // a window as wide as the step, which is exact only while a step is no longer than the rate's period:
+        // longer, and the counter jumps the window and stalls until it wraps, 33 ms. The shortest period is
+        // 9 clocks, for a rate of 0; the next is 32. So a whole sample is one step unless a voice is at rate
+        // 0 now, when the sample goes in steps of 9 -- either way the same envelope, clock for clock, as the
+        // player's steps of an instruction's few clocks, at a third of the calls.
         _cycles += _c64->SampleClockRatio;
         int clocks = (int)(_cycles >> 4);
         _cycles &= 15;
+        int longest = clocks;
+        for (int v = 0; v < 3; v++) {
+            const uint8_t state = _sid->ADSRstate[v * 7], ad = _regs[v * 7 + 5], sr = _regs[v * 7 + 6];
+            const uint8_t rate = (state & 0x80) ? (ad >> 4) : (state & 0x40) ? (ad & 0x0f) : (sr & 0x0f);
+            if (rate == 0) { longest = 9; }
+        }
         while (clocks > 0) {
-            int step = clocks > 7 ? 7 : clocks;
+            int step = clocks > longest ? longest : clocks;
             cRSID_emulateADSRs(_sid, (char) step);
             clocks -= step;
         }

@@ -1,6 +1,13 @@
 
 //cRSID SID emulation engine
 
+#ifdef CRSID_IRAM /* Atech firmware: the SID's two hot functions in internal RAM, where the flash cache cannot evict them */
+ #include "esp_attr.h"
+ #define CRSID_HOT IRAM_ATTR
+#else
+ #define CRSID_HOT
+#endif
+
 
 void cRSID_createSIDchip (cRSID_C64instance* C64, cRSID_SIDinstance* SID, unsigned short model, unsigned short baseaddress) {
  SID->C64 = C64;
@@ -27,7 +34,7 @@ void cRSID_initSIDchip (cRSID_SIDinstance* SID) {
 }
 
 
-void cRSID_emulateADSRs (cRSID_SIDinstance *SID, char cycles) {
+CRSID_HOT void cRSID_emulateADSRs (cRSID_SIDinstance *SID, char cycles) {
 
  enum ADSRstateBits { GATE_BITVAL=0x01, ATTACK_BITVAL=0x80, DECAYSUSTAIN_BITVAL=0x40, HOLDZEROn_BITVAL=0x10 };
 
@@ -90,7 +97,7 @@ void cRSID_emulateADSRs (cRSID_SIDinstance *SID, char cycles) {
 
 
 
-int cRSID_emulateWaves (cRSID_SIDinstance *SID) {
+CRSID_HOT int cRSID_emulateWaves (cRSID_SIDinstance *SID) {
 
  enum SIDspecs { CHANNELS=3+1, VOLUME_MAX=0xF, D418_DIGI_VOLUME=2 }; //digi-channel is counted too
  enum WaveFormBits { NOISE_BITVAL=0x80, PULSE_BITVAL=0x40, SAW_BITVAL=0x20, TRI_BITVAL=0x10 };
